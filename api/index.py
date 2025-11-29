@@ -7,11 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import subprocess
+import glob
+import re
 
-# --- FastAPIインスタンス ---
 app = FastAPI()
 
-# --- CORS設定 ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],       
@@ -20,12 +20,9 @@ app.add_middleware(
     allow_headers=["*"],       
 )
 
-# スレッドプール
 executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
-# FFmpegのパス (Dockerfileでシステムにインストールされるため、通常は 'ffmpeg' でOK)
 FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg") 
 
-# yt-dlp の基本オプション
 ydl_opts = {
     "quiet": True,
     "skip_download": True,
@@ -34,7 +31,6 @@ ydl_opts = {
     "proxy": "http://ytproxy-siawaseok.duckdns.org:3007" 
 }
 
-# キャッシュ: { video_id: (timestamp, data, duration) }
 CACHE = {}
 DEFAULT_CACHE_DURATION = 600
 LONG_CACHE_DURATION = 14200
@@ -46,7 +42,6 @@ def cleanup_cache():
         del CACHE[vid]
     print(f"--- Cache Cleanup: Removed {len(expired)} entries. ---")
 
-# --- 情報取得のヘルパー関数（キャッシュ利用・更新機能を含む） ---
 async def _fetch_and_cache_info(video_id: str):
     current_time = time.time()
     cleanup_cache()
@@ -105,17 +100,11 @@ async def _fetch_and_cache_info(video_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to fetch stream info: {str(e)}")
 
 
-# ==============================================================================
-# エンドポイント 1: /stream/{video_id} (全フォーマット)
-# ==============================================================================
 @app.get("/stream/{video_id}")
 async def get_streams(video_id: str):
     return await _fetch_and_cache_info(video_id)
 
 
-# ==============================================================================
-# エンドポイント 2: /m3u8/{video_id} (HLS/DASHマニフェスト)
-# ==============================================================================
 @app.get("/m3u8/{video_id}")
 async def get_m3u8_streams(video_id: str):
     
@@ -145,9 +134,6 @@ async def get_m3u8_streams(video_id: str):
     return m3u8_response
 
 
-# ==============================================================================
-# エンドポイント 3: /high/{video_id} (純粋な bestvideo+bestaudio 相当)
-# ==============================================================================
 @app.get("/high/{video_id}")
 async def get_high_quality_stream(video_id: str):
     
@@ -187,93 +173,70 @@ async def get_high_quality_stream(video_id: str):
     
     return high_response
 
+def run_ytdlp_merge(video_id: str):
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    
+    output_template = f"/tmp/{video_id}_%(title)s.%(ext)s"
+    
+    merge_opts = {
+        "quiet": False, 
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best", 
+        "merge_output_format": "mp4", 
+        "outtmpl": output_template,
+        "nocheckcertificate": True,
+        "retries": 5, 
+        "proxy": "http://ytproxy-siawaseok.duckdns.org:3007",
+    }
+    
+    try:
+        with YoutubeDL(merge_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            
+            safe_title = re.sub(r'[^\w\-_\. ]', '', info.get('title', video_id))
+            final_filename_template = f"/tmp/{video_id}_{safe_title}.mp4"
+            
+            search_path = f"/tmp/{video_id}_*.mp4"
+            files = glob.glob(search_path)
+            
+            if files:
+                return max(files, key=os.path.getctime)
+            else:
+                raise Exception("yt-dlpがファイルを保存できませんでした。")
 
-# ==============================================================================
-# エンドポイント 4: /merge/{video_id} (FFmpegで結合して返す)
-# ==============================================================================
+    except Exception as e:
+        print(f"yt-dlp merge error: {e}")
+        raise Exception(f"yt-dlpによる結合に失敗しました: {str(e)}")
+
+
 @app.get("/merge/{video_id}")
 async def get_merged_stream(video_id: str):
     
-    # 1. URL情報を取得 (既存の /high のロジックを再利用)
-    try:
-        high_response = await get_high_quality_stream(video_id)
-        best_video = high_response["best_video"]
-        best_audio = high_response["best_audio"]
-    except HTTPException as e:
-        raise e
-
-    if not best_video or not best_audio:
-        raise HTTPException(status_code=404, detail="結合に必要な動画または音声ストリームが見つかりませんでした。")
-    
-    video_url = best_video["url"]
-    audio_url = best_audio["url"]
-    title = high_response["title"]
-    
-    # 2. FFmpeg実行関数 (ブロッキング処理)
-    def run_ffmpeg_merge():
-        # Render環境の一時ディレクトリ /tmp に保存
-        output_filename = f"/tmp/{video_id}.mp4" 
-        
-        # FFmpegコマンドの組み立て
-        # -i: 入力 (動画URL, 音声URL)
-        # -c copy: エンコードせずにストリームをコピー（最速で結合）
-        # -y: 既存ファイルの上書きを許可
-        command = [
-            FFMPEG_PATH,
-            "-i", video_url,
-            "-i", audio_url,
-            "-c", "copy",
-            "-y",
-            output_filename
-        ]
-        
-        try:
-            print(f"Executing FFmpeg: {' '.join(command)}")
-            # コマンド実行 (タイムアウトは動画の長さに応じて調整)
-            result = subprocess.run(
-                command, 
-                capture_output=True, 
-                text=True, 
-                check=True,
-                timeout=300 # 5分間のタイムアウト
-            )
-            print("FFmpeg finished successfully.")
-            return output_filename
-        except subprocess.CalledProcessError as e:
-            print(f"FFmpeg Error (STDOUT): {e.stdout}")
-            print(f"FFmpeg Error (STDERR): {e.stderr}")
-            raise Exception(f"FFmpeg failed (結合エラー): {e.stderr}")
-        except subprocess.TimeoutExpired:
-            raise Exception("FFmpeg process timed out.")
-            
-    # 3. スレッドプールでFFmpegを実行し、ファイルを返す
     output_file_path = None
     try:
-        loop = asyncio.get_event_loop()
-        output_file_path = await loop.run_in_executor(executor, run_ffmpeg_merge)
+        info = await _fetch_and_cache_info(video_id)
+        title = info.get("title", video_id)
 
-        # FileResponseで結合されたファイルを返す
+        loop = asyncio.get_event_loop()
+        output_file_path = await loop.run_in_executor(executor, run_ytdlp_merge, video_id)
+
+        safe_title = re.sub(r'[^\w\-_\. ]', '', title.replace(' ', '_'))[:50]
+        
         return FileResponse(
             output_file_path, 
             media_type="video/mp4", 
-            # ファイル名を日本語タイトルから安全なものに変換
-            filename=f"{video_id}_{title.replace(' ', '_')[:30]}.mp4"
+            filename=f"{video_id}_{safe_title}.mp4"
         )
         
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # 4. 一時ファイルをクリーンアップ
         if output_file_path and os.path.exists(output_file_path):
             os.remove(output_file_path)
             print(f"Cleaned up {output_file_path}")
 
 
-# ==============================================================================
-# キャッシュ管理エンドポイント
-# ==============================================================================
-
-# --- キャッシュ削除API ---
 @app.delete("/cache/{video_id}")
 def delete_cache(video_id: str):
     if video_id in CACHE:
@@ -283,7 +246,6 @@ def delete_cache(video_id: str):
     else:
         raise HTTPException(status_code=404, detail="指定されたIDのキャッシュは存在しません。")
 
-# --- キャッシュ一覧確認用 ---
 @app.get("/cache")
 def list_cache():
     now = time.time()
