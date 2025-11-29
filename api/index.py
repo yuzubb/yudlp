@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask # 👈 ここをインポート
 from yt_dlp import YoutubeDL
 import time
 import asyncio
@@ -208,6 +209,12 @@ def run_ytdlp_merge(video_id: str):
         print(f"yt-dlp merge error: {e}")
         raise Exception(f"yt-dlpによる結合に失敗しました: {str(e)}")
 
+# 👈 ファイル削除を担う新しい関数
+def _cleanup_file(path: str):
+    if os.path.exists(path):
+        os.remove(path)
+        print(f"Cleaned up {path} after response.")
+
 
 @app.get("/merge/{video_id}")
 async def get_merged_stream(video_id: str):
@@ -225,17 +232,23 @@ async def get_merged_stream(video_id: str):
         return FileResponse(
             output_file_path, 
             media_type="video/mp4", 
-            filename=f"{video_id}_{safe_title}.mp4"
+            filename=f"{video_id}_{safe_title}.mp4",
+            background=BackgroundTask(_cleanup_file, output_file_path) # 👈 バックグラウンドタスクで削除
         )
         
     except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
+        # エラーが発生した場合は、念のためファイルを削除
         if output_file_path and os.path.exists(output_file_path):
             os.remove(output_file_path)
-            print(f"Cleaned up {output_file_path}")
+            print(f"Cleaned up {output_file_path} after HTTPException.")
+        raise e
+    except Exception as e:
+        # エラーが発生した場合は、念のためファイルを削除
+        if output_file_path and os.path.exists(output_file_path):
+            os.remove(output_file_path)
+            print(f"Cleaned up {output_file_path} after Exception.")
+        raise HTTPException(status_code=500, detail=str(e))
+    # 💥 finallyブロックは削除されました 💥
 
 
 @app.delete("/cache/{video_id}")
@@ -258,4 +271,4 @@ def list_cache():
             "duration_sec": dur
         }
         for vid, (ts, _, dur) in CACHE.items()
-    }
+}
