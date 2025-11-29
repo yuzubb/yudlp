@@ -186,6 +186,7 @@ def run_ytdlp_merge(video_id: str):
         "nocheckcertificate": True,
         "retries": 5, 
         "proxy": "http://ytproxy-siawaseok.duckdns.org:3007",
+        "keep_videos": True,
     }
     
     try:
@@ -257,4 +258,4 @@ def list_cache():
             "duration_sec": dur
         }
         for vid, (ts, _, dur) in CACHE.items()
-        }
+    }
