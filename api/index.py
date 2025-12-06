@@ -21,7 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
+executor = ThreadPoolExecutor()
 FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
 
 ydl_opts = {
@@ -50,7 +50,6 @@ def cleanup_cache():
 async def _fetch_and_cache_info(video_id: str):
     current_time = time.time()
     cleanup_cache()
-    info_data = None
 
     if video_id in CACHE:
         timestamp, data, duration = CACHE[video_id]
