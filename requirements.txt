@@ -1,7 +1,7 @@
-fastapi
-uvicorn
-yt-dlp
-pydantic
-python-multipart
-curl_cffi
-requests
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+yt-dlp>=2024.3.10
+requests>=2.31.0
+python-multipart>=0.0.6
+pysocks>=1.7.1
+requests[socks]>=2.31.0
