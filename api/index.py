@@ -22,7 +22,7 @@ app.add_middleware(
 
 executor = ThreadPoolExecutor()
 
-PROXY_URL = "http://your-proxy-service.onrender.com"
+PROXY_URL = "http://yt-kwuf.onrender.com"
 
 class MyLogger:
     def debug(self, msg):
@@ -39,7 +39,7 @@ ydl_opts = {
     "skip_download": True,
     "nocheckcertificate": True,
     "proxy": PROXY_URL,
-    "impersonate": "chrome",
+    "impersonate": "chrome110",
     "skip_live_postprocessor": True,
     "noplaylist": True,
     "getdescription": False,
