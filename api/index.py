@@ -27,15 +27,15 @@ app.add_middleware(
 executor = ThreadPoolExecutor(max_workers=4)
 FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
 
-# 固定SOCKS5プロキシ
-SOCKS5_PROXY = "socks5://42.126.75.114:3007"
+# 固定プロキシ（HTTPプロキシとして使用）
+PROXY_URL = "http://42.126.75.114:3007"
 
 CACHE = {}
 DEFAULT_CACHE_DURATION = 1800
 LONG_CACHE_DURATION = 14400
 
 def get_ydl_opts():
-    """yt-dlpオプション（SOCKS5プロキシ固定）"""
+    """yt-dlpオプション（HTTPプロキシ固定）"""
     return {
         "quiet": False,
         "no_warnings": False,
@@ -47,7 +47,7 @@ def get_ydl_opts():
         "fragment_retries": 3,
         "socket_timeout": 30,
         "http_chunk_size": 10485760,
-        "proxy": SOCKS5_PROXY,
+        "proxy": PROXY_URL,
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
 
@@ -61,7 +61,7 @@ def cleanup_cache():
         logger.info(f"Cleaned up {len(expired)} cache entries")
 
 async def _fetch_and_cache_info(video_id: str):
-    """動画情報を取得（SOCKS5プロキシ使用）"""
+    """動画情報を取得（HTTPプロキシ使用）"""
     current_time = time.time()
     cleanup_cache()
     
@@ -75,7 +75,7 @@ async def _fetch_and_cache_info(video_id: str):
     url = f"https://www.youtube.com/watch?v={video_id}"
     ydl_opts = get_ydl_opts()
     
-    logger.info(f"Fetching {video_id} via SOCKS5 proxy: {SOCKS5_PROXY}")
+    logger.info(f"Fetching {video_id} via HTTP proxy: {PROXY_URL}")
     
     def fetch_info():
         try:
@@ -216,7 +216,7 @@ def run_ytdlp_merge(video_id: str):
         "outtmpl": output_template,
         "nocheckcertificate": True,
         "retries": 5,
-        "proxy": SOCKS5_PROXY,
+        "proxy": PROXY_URL,
         "keep_videos": True,
     }
     
@@ -278,8 +278,8 @@ async def get_merged_stream(video_id: str):
 def proxy_info():
     """プロキシ情報を表示"""
     return {
-        "proxy": SOCKS5_PROXY,
-        "type": "SOCKS5",
+        "proxy": PROXY_URL,
+        "type": "HTTP",
         "cache_entries": len(CACHE)
     }
 
@@ -321,6 +321,6 @@ def health_check():
     """ヘルスチェック"""
     return {
         "status": "ok",
-        "proxy": SOCKS5_PROXY,
+        "proxy": PROXY_URL,
         "cache_entries": len(CACHE)
     }
