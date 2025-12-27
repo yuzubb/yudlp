@@ -27,8 +27,8 @@ app.add_middleware(
 executor = ThreadPoolExecutor(max_workers=4)
 FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
 
-# 固定プロキシ（HTTPプロキシとして使用）
-PROXY_URL = "http://42.126.75.114:3007"
+# 固定プロキシ（RenderのNginxプロキシ）
+PROXY_URL = "https://ytp-nmao.onrender.com"
 
 CACHE = {}
 DEFAULT_CACHE_DURATION = 1800
