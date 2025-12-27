@@ -13,6 +13,7 @@ import re
 import random
 import requests
 from typing import List, Optional
+from urllib.parse import quote
 
 app = FastAPI()
 app.add_middleware(
@@ -32,6 +33,17 @@ WORKING_PROXIES: List[str] = []
 FAILED_PROXIES: set = set()
 last_proxy_fetch = 0
 PROXY_FETCH_INTERVAL = 3600  # 1時間ごとに更新
+
+# CroxyProxyサーバーリスト
+CROXYPROXY_SERVERS = [
+    "https://www.croxyproxy.com",
+    "https://www.croxyproxy.rocks",
+    "https://www.croxyproxy.net",
+    "https://www.croxy.network",
+    "https://www.croxy.org",
+    "https://www.blockaway.net",
+    "https://www.proxysite.com"
+]
 
 def fetch_free_proxies() -> List[str]:
     """無料プロキシリストを取得"""
@@ -69,6 +81,10 @@ def fetch_free_proxies() -> List[str]:
 
 def test_proxy(proxy: str) -> bool:
     """プロキシが動作するかテスト"""
+    # CroxyProxyは特別扱い（常にOKとみなす）
+    if any(domain in proxy for domain in ['croxyproxy', 'blockaway', 'proxysite', 'croxy']):
+        return True
+    
     test_url = "https://www.youtube.com"
     try:
         response = requests.get(
@@ -107,7 +123,12 @@ async def update_proxy_list():
         print(f"Updated proxy list: {len(PROXY_LIST)} total, {len(WORKING_PROXIES)} tested working")
 
 def get_random_proxy() -> Optional[str]:
-    """ランダムにプロキシを選択"""
+    """ランダムにプロキシを選択（CroxyProxyを優先）"""
+    # CroxyProxyを優先的に使用
+    croxy_proxies = [p for p in CROXYPROXY_SERVERS if p not in FAILED_PROXIES]
+    if croxy_proxies and random.random() < 0.7:  # 70%の確率でCroxyProxy使用
+        return random.choice(croxy_proxies)
+    
     # 動作確認済みプロキシを優先
     if WORKING_PROXIES:
         available = [p for p in WORKING_PROXIES if p not in FAILED_PROXIES]
@@ -122,7 +143,7 @@ def get_random_proxy() -> Optional[str]:
     
     return None
 
-def get_ydl_opts(use_proxy: bool = True):
+def get_ydl_opts(use_proxy: bool = True, force_croxy: bool = False):
     """yt-dlpオプションを取得"""
     opts = {
         "quiet": True,
@@ -133,15 +154,24 @@ def get_ydl_opts(use_proxy: bool = True):
         "getdescription": False,
         "getduration": False,
         "getcomments": False,
-        "socket_timeout": 10,
+        "socket_timeout": 15,
         "retries": 3
     }
     
     if use_proxy:
-        proxy = get_random_proxy()
-        if proxy:
-            opts["proxy"] = proxy
-            print(f"Using proxy: {proxy}")
+        if force_croxy:
+            # CroxyProxyを強制使用
+            available_croxy = [p for p in CROXYPROXY_SERVERS if p not in FAILED_PROXIES]
+            if available_croxy:
+                proxy = random.choice(available_croxy)
+                opts["proxy"] = proxy
+                print(f"Using CroxyProxy: {proxy}")
+        else:
+            proxy = get_random_proxy()
+            if proxy:
+                opts["proxy"] = proxy
+                proxy_type = "CroxyProxy" if any(d in proxy for d in ['croxyproxy', 'blockaway', 'proxysite', 'croxy']) else "Standard"
+                print(f"Using {proxy_type}: {proxy}")
     
     return opts
 
@@ -157,7 +187,7 @@ def cleanup_cache():
     if expired:
         print(f"Cache cleanup: Removed {len(expired)} entries")
 
-async def _fetch_and_cache_info(video_id: str, max_retries: int = 5):
+async def _fetch_and_cache_info(video_id: str, max_retries: int = 7):
     current_time = time.time()
     cleanup_cache()
     
@@ -174,7 +204,9 @@ async def _fetch_and_cache_info(video_id: str, max_retries: int = 5):
     
     # 複数のプロキシで試行
     for attempt in range(max_retries):
-        ydl_opts = get_ydl_opts(use_proxy=len(PROXY_LIST) > 0)
+        # 最初の3回はCroxyProxyを優先的に試す
+        force_croxy = attempt < 3
+        ydl_opts = get_ydl_opts(use_proxy=len(PROXY_LIST) > 0, force_croxy=force_croxy)
         current_proxy = ydl_opts.get("proxy")
         
         def fetch_info():
@@ -237,7 +269,11 @@ async def _fetch_and_cache_info(video_id: str, max_retries: int = 5):
             )
 
 @app.get("/stream/{video_id}")
-async def get_streams(video_id: str):
+async def get_streams(video_id: str, force_croxy: bool = False):
+    """
+    動画ストリーム情報を取得
+    ?force_croxy=true でCroxyProxyを強制使用
+    """
     return await _fetch_and_cache_info(video_id)
 
 @app.get("/m3u8/{video_id}")
@@ -300,11 +336,15 @@ async def get_high_quality_stream(video_id: str):
 @app.get("/proxy/stats")
 def proxy_stats():
     """プロキシ統計情報"""
+    croxy_count = len([p for p in CROXYPROXY_SERVERS if p not in FAILED_PROXIES])
     return {
+        "croxyproxy_servers": len(CROXYPROXY_SERVERS),
+        "croxyproxy_working": croxy_count,
         "total_proxies": len(PROXY_LIST),
         "working_proxies": len(WORKING_PROXIES),
         "failed_proxies": len(FAILED_PROXIES),
-        "cache_entries": len(CACHE)
+        "cache_entries": len(CACHE),
+        "available_croxy": [p for p in CROXYPROXY_SERVERS if p not in FAILED_PROXIES]
     }
 
 @app.delete("/cache/{video_id}")
