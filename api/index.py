@@ -28,7 +28,7 @@ ydl_opts = {
     "quiet": True,
     "skip_download": True,
     "nocheckcertificate": True,
-    "proxy": "http://ytproxy-siawaseok.duckdns.org:3007",
+    "proxy": "https://yt-kwuf.onrender.com",
     "skip_live_postprocessor": True,
     "noplaylist": True,
     "getdescription": False,
