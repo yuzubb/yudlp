@@ -3,3 +3,5 @@ uvicorn
 yt-dlp
 pydantic
 python-multipart
+curl_cffi
+requests
