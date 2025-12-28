@@ -28,7 +28,7 @@ executor = ThreadPoolExecutor(max_workers=4)
 FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
 
 # 固定プロキシ（HTTPプロキシとして使用）
-PROXY_URL = "https://443a8512-0cb2-46b3-8d4b-c3955ee3cc76-00-qvy8mcsrd7o.sisko.replit.dev"
+PROXY_URL = "http://443a8512-0cb2-46b3-8d4b-c3955ee3cc76-00-qvy8mcsrd7o.sisko.replit.dev:3000"
 
 CACHE = {}
 DEFAULT_CACHE_DURATION = 1800
