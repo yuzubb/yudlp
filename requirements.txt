@@ -5,3 +5,4 @@ requests>=2.31.0
 python-multipart>=0.0.6
 pysocks>=1.7.1
 requests[socks]>=2.31.0
+pytube
