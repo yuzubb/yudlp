@@ -316,6 +316,107 @@ def list_cache():
         for vid, (ts, data, dur) in CACHE.items()
     }
 
+# 既存のインポートに追加
+# from fastapi import FastAPI, HTTPException ... (略)
+
+@app.get("/api/v3/info/{video_id}")
+async def get_video_info_v3(video_id: str):
+    """
+    動画の詳細情報（タイトル、サムネイル、チャンネル、概要、関連動画など）を取得
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    ydl_opts = get_ydl_opts()
+    
+    # 関連動画を取得するためのオプションを追加設定
+    # extract_flat: False にすることで関連動画の詳細も取得を試みます
+    ydl_opts.update({
+        "extract_flat": False,
+        "quiet": True,
+    })
+
+    def fetch_full_info():
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception as e:
+            logger.error(f"yt-dlp full info error: {str(e)}")
+            raise
+
+    try:
+        loop = asyncio.get_event_loop()
+        # 関連動画の取得は時間がかかる場合があるためタイムアウトを少し長めに設定
+        raw_info = await asyncio.wait_for(
+            loop.run_in_executor(executor, fetch_full_info),
+            timeout=80
+        )
+
+        # 関連動画のリストを整形
+        related_videos = []
+        # yt-dlpのバージョンや抽出器により 'entries' または 'related_videos' に格納される
+        raw_related = raw_info.get("entries") or raw_info.get("related_videos") or []
+        
+        for entry in raw_related:
+            related_videos.append({
+                "id": entry.get("id"),
+                "title": entry.get("title"),
+                "thumbnail": entry.get("thumbnail"),
+                "uploader": entry.get("uploader") or entry.get("channel"),
+                "duration": entry.get("duration"),
+                "view_count": entry.get("view_count"),
+                "url": f"https://www.youtube.com/watch?v={entry.get('id')}" if entry.get("id") else None
+            })
+
+        # レスポンスデータの構築（取得できる情報を網羅）
+        response_data = {
+            "id": raw_info.get("id"),
+            "title": raw_info.get("title"),
+            "thumbnail": raw_info.get("thumbnail"),
+            "description": raw_info.get("description"), # 概要
+            "duration": raw_info.get("duration"),
+            "view_count": raw_info.get("view_count"),
+            "like_count": raw_info.get("like_count"),
+            "upload_date": raw_info.get("upload_date"), # YYYYMMDD
+            "uploader": raw_info.get("uploader"),
+            "uploader_id": raw_info.get("uploader_id"),
+            "uploader_url": raw_info.get("uploader_url"),
+            "channel": raw_info.get("channel"),
+            "channel_id": raw_info.get("channel_id"),
+            "channel_url": raw_info.get("channel_url"),
+            "channel_follower_count": raw_info.get("channel_follower_count"),
+            "tags": raw_info.get("tags"),
+            "categories": raw_info.get("categories"),
+            "is_live": raw_info.get("is_live"),
+            
+            # 関連動画
+            "related_videos": related_videos,
+            
+            # フォーマット情報（既存のロジックを流用）
+            "formats": [
+                {
+                    "itag": f.get("format_id"),
+                    "ext": f.get("ext"),
+                    "resolution": f.get("resolution"),
+                    "acodec": f.get("acodec"),
+                    "vcodec": f.get("vcodec"),
+                    "url": f.get("url"),
+                    "filesize": f.get("filesize"),
+                }
+                for f in raw_info.get("formats", [])
+                if f.get("url") and f.get("ext") != "mhtml"
+            ]
+        }
+
+        # 既存のキャッシュロジックへの統合（オプション）
+        current_time = time.time()
+        CACHE[video_id] = (current_time, response_data, DEFAULT_CACHE_DURATION)
+
+        return response_data
+
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Full info request timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch full info: {str(e)}")
+
 @app.get("/health")
 def health_check():
     """ヘルスチェック"""
