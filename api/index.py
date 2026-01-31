@@ -1,138 +1,131 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from starlette.background import BackgroundTask
-from pytube import YouTube
+from yt_dlp import YoutubeDL
 import time
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from fastapi.middleware.cors import CORSMiddleware
-import os
-import re
-import logging
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# --- CORS設定 ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],       # 全オリジン許可
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],       # GET, POST, DELETEなど全て許可
+    allow_headers=["*"],       # カスタムヘッダーも許可
 )
 
-executor = ThreadPoolExecutor(max_workers=4)
+# スレッドプール（yt-dlp は同期的なのでスレッドで動かす）
+executor = ThreadPoolExecutor()
+
+# yt-dlp の基本オプション
+ydl_opts = {
+    "quiet": True,
+    "skip_download": True,
+    "nocheckcertificate": True,
+    "format": "bestvideo+bestaudio/best",
+    "proxy": "http://ytproxy-siawaseok.duckdns.org:3007"
+}
+
+# キャッシュ: { video_id: (timestamp, data, duration) }
 CACHE = {}
-DEFAULT_CACHE_DURATION = 1800
+DEFAULT_CACHE_DURATION = 600    # 通常: 10分
+LONG_CACHE_DURATION = 14200     # URL数が多い場合: 4時間
 
-def fetch_yt_data(video_id: str):
+def cleanup_cache():
+    """期限切れのキャッシュを削除"""
+    now = time.time()
+    expired = [vid for vid, (ts, _, dur) in CACHE.items() if now - ts >= dur]
+    for vid in expired:
+        del CACHE[vid]
+
+@app.get("/api/2/streams/{video_id}")
+async def get_streams(video_id: str):
+    """指定した YouTube の video_id のストリーム情報を返す"""
+    current_time = time.time()
+    cleanup_cache()  # 毎回古いキャッシュを整理
+
+    # --- キャッシュチェック ---
+    if video_id in CACHE:
+        timestamp, data, duration = CACHE[video_id]
+        if current_time - timestamp < duration:
+            return data  # キャッシュから即返す
+
     url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # yt-dlp 実行部分を関数化
+    def fetch_info():
+        with YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
     try:
-        yt = YouTube(url)
-        
-        formats = []
-        for stream in yt.streams:
-            formats.append({
-                "itag": stream.itag,
-                "ext": stream.mime_type.split('/')[-1],
-                "resolution": stream.resolution,
-                "fps": getattr(stream, 'fps', None),
-                "vcodec": stream.video_codec,
-                "acodec": stream.audio_codec,
-                "url": stream.url,
-                "filesize": stream.filesize,
-                "type": stream.type
-            })
+        # スレッドで yt-dlp を実行（非同期に待機）
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(executor, fetch_info)
 
-        related_videos = []
-        # pytubeの仕様上、initial_dataから関連動画を抽出
-        try:
-            results = yt.initial_data.get('contents', {}).get('twoColumnWatchNextResults', {}) \
-                        .get('secondaryResults', {}).get('secondaryResults', {}).get('results', [])
-            for res in results:
-                v = res.get('compactVideoRenderer')
-                if v:
-                    related_videos.append({
-                        "id": v.get('videoId'),
-                        "title": v.get('title', {}).get('simpleText'),
-                        "thumbnail": v.get('thumbnail', {}).get('thumbnails', [{}])[0].get('url'),
-                        "uploader": v.get('shortBylineText', {}).get('runs', [{}])[0].get('text'),
-                        "view_count": v.get('viewCountText', {}).get('simpleText')
-                    })
-        except Exception:
-            pass
+        # --- フォーマット整理 ---
+        formats = [
+            {
+                "itag": f.get("format_id"),
+                "ext": f.get("ext"),
+                "resolution": f.get("resolution"),
+                "fps": f.get("fps"),
+                "acodec": f.get("acodec"),
+                "vcodec": f.get("vcodec"),
+                "url": f.get("url")
+            }
+            for f in info.get("formats", [])
+            if f.get("url") and f.get("ext") != "mhtml"
+        ]
 
-        return {
+        # --- レスポンスデータ作成 ---
+        response_data = {
+            "title": info.get("title"),
             "id": video_id,
-            "title": yt.title,
-            "description": yt.description,
-            "thumbnail": yt.thumbnail_url,
-            "duration": yt.length,
-            "view_count": yt.views,
-            "uploader": yt.author,
-            "channel_id": yt.channel_id,
-            "channel_url": yt.channel_url,
-            "publish_date": str(yt.publish_date),
-            "keywords": yt.keywords,
-            "related_videos": related_videos,
             "formats": formats
         }
-    except Exception as e:
-        logger.error(f"Pytube error: {e}")
-        raise e
 
-@app.get("/api/v3/info/{video_id}")
-async def get_video_info_v3(video_id: str):
-    now = time.time()
-    if video_id in CACHE:
-        ts, data, dur = CACHE[video_id]
-        if now - ts < dur:
-            return data
-
-    try:
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(executor, fetch_yt_data, video_id)
-        CACHE[video_id] = (now, info, DEFAULT_CACHE_DURATION)
-        return info
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/stream/{video_id}")
-async def get_streams(video_id: str):
-    info = await get_video_info_v3(video_id)
-    return {"id": video_id, "formats": info["formats"]}
-
-def download_and_merge(video_id: str):
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    yt = YouTube(url)
-    video = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
-    path = video.download(output_path="/tmp", filename=f"{video_id}.mp4")
-    return path
-
-def _cleanup_file(path: str):
-    if os.path.exists(path):
-        os.remove(path)
-
-@app.get("/merge/{video_id}")
-async def get_merged_stream(video_id: str):
-    try:
-        loop = asyncio.get_event_loop()
-        path = await loop.run_in_executor(executor, download_and_merge, video_id)
-        return FileResponse(
-            path,
-            media_type="video/mp4",
-            filename=f"{video_id}.mp4",
-            background=BackgroundTask(_cleanup_file, path)
+        # --- キャッシュ期間を決定 ---
+        cache_duration = (
+            LONG_CACHE_DURATION if len(formats) >= 12 else DEFAULT_CACHE_DURATION
         )
+
+        # --- キャッシュに保存 ---
+        CACHE[video_id] = (current_time, response_data, cache_duration)
+
+        # --- ログ出力 ---
+        if cache_duration == LONG_CACHE_DURATION:
+            print(f"{video_id} の4時間キャッシュを作成しました。")
+        else:
+            print(f"{video_id} の10分キャッシュを作成しました。")
+
+        return response_data
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "library": "pytube"}
+# --- キャッシュ削除API ---
+@app.delete("/api/2/cache/{video_id}")
+def delete_cache(video_id: str):
+    """指定した video_id のキャッシュを削除"""
+    if video_id in CACHE:
+        del CACHE[video_id]
+        print(f"{video_id} のキャッシュを削除しました。")
+        return {"status": "success", "message": f"{video_id} のキャッシュを削除しました。"}
+    else:
+        raise HTTPException(status_code=404, detail="指定されたIDのキャッシュは存在しません。")
 
-@app.delete("/cache")
-def clear_cache():
-    CACHE.clear()
-    return {"status": "cleared"}
+# --- キャッシュ一覧確認用 ---
+@app.get("/api/2/cache")
+def list_cache():
+    """現在のキャッシュ一覧を返す"""
+    now = time.time()
+    return {
+        vid: {
+            "age_sec": int(now - ts),
+            "remaining_sec": int(dur - (now - ts)),
+            "duration_sec": dur
+        }
+        for vid, (ts, _, dur) in CACHE.items()
+    }
