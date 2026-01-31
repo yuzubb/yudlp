@@ -40,7 +40,7 @@ def cleanup_cache():
     for vid in expired:
         del CACHE[vid]
 
-@app.get("/api/2/streams/{video_id}")
+@app.get("/stream/{video_id}")
 async def get_streams(video_id: str):
     """指定した YouTube の video_id のストリーム情報を返す"""
     current_time = time.time()
@@ -106,7 +106,7 @@ async def get_streams(video_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- キャッシュ削除API ---
-@app.delete("/api/2/cache/{video_id}")
+@app.delete("/cache/{video_id}")
 def delete_cache(video_id: str):
     """指定した video_id のキャッシュを削除"""
     if video_id in CACHE:
@@ -117,7 +117,7 @@ def delete_cache(video_id: str):
         raise HTTPException(status_code=404, detail="指定されたIDのキャッシュは存在しません。")
 
 # --- キャッシュ一覧確認用 ---
-@app.get("/api/2/cache")
+@app.get("/cache")
 def list_cache():
     """現在のキャッシュ一覧を返す"""
     now = time.time()
