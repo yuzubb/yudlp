@@ -5,6 +5,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from fastapi.middleware.cors import CORSMiddleware
 import os
+import tempfile
 
 app = FastAPI()
 
@@ -19,20 +20,8 @@ app.add_middleware(
 
 executor = ThreadPoolExecutor()
 
-# クッキーファイルのパス（apiディレクトリ内にあることを想定）
-# ファイル名はアップロードされた名前に合わせる
-COOKIE_FILE = os.path.join(os.path.dirname(__file__), "youtube-cookies.txt")
-
-# 基本的な yt-dlp オプション
-ydl_opts_base = {
-    "quiet": True,
-    "skip_download": True,
-    "nocheckcertificate": True,
-    "format": "bestvideo+bestaudio/best",
-    "cookiefile": COOKIE_FILE,
-    # --- 読み取り専用エラー(Errno 30)対策 ---
-    "no_cookies_file": True,  # クッキーの更新をファイルに書き戻さない
-}
+# 元のクッキーファイルのパス
+ORIGINAL_COOKIE = os.path.join(os.path.dirname(__file__), "youtube-cookies.txt")
 
 # キャッシュと処理中リスト
 CACHE = {}
@@ -48,9 +37,9 @@ def cleanup_cache():
 
 @app.get("/stream/{video_id}")
 async def get_streams(video_id: str):
-    # ファイル存在チェック
-    if not os.path.exists(COOKIE_FILE):
-        raise HTTPException(status_code=500, detail=f"Cookie file not found at {COOKIE_FILE}")
+    # クッキーファイルの存在確認
+    if not os.path.exists(ORIGINAL_COOKIE):
+        raise HTTPException(status_code=500, detail="Cookie file not found in API directory.")
 
     current_time = time.time()
     cleanup_cache()
@@ -63,9 +52,27 @@ async def get_streams(video_id: str):
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     def fetch_info():
-        # クッキーを使用して情報を取得
-        with YoutubeDL(ydl_opts_base) as ydl:
-            return ydl.extract_info(url, download=False)
+        # --- 読み取り専用エラー対策: /tmp に一時的なコピーを作成 ---
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as tmp:
+            with open(ORIGINAL_COOKIE, 'r') as f:
+                tmp.write(f.read())
+            temp_cookie_path = tmp.name
+
+        try:
+            ydl_opts = {
+                "quiet": True,
+                "skip_download": True,
+                "nocheckcertificate": True,
+                "format": "bestvideo+bestaudio/best",
+                "cookiefile": temp_cookie_path,
+                "no_cookies_file": True, # 書き込みを行わない設定
+            }
+            with YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        finally:
+            # 使用後に一時ファイルを削除
+            if os.path.exists(temp_cookie_path):
+                os.remove(temp_cookie_path)
 
     PROCESSING_IDS.add(video_id)
     try:
@@ -92,7 +99,6 @@ async def get_streams(video_id: str):
             "formats": formats
         }
 
-        # 取得できたフォーマット数に応じてキャッシュ時間を調整
         cache_duration = LONG_CACHE_DURATION if len(formats) >= 12 else DEFAULT_CACHE_DURATION
         CACHE[video_id] = (current_time, response_data, cache_duration)
 
@@ -109,17 +115,6 @@ def get_status():
     return {
         "processing_count": len(PROCESSING_IDS),
         "cache_count": len(CACHE),
-        "cookie_file_exists": os.path.exists(COOKIE_FILE)
+        "cookie_path": ORIGINAL_COOKIE,
+        "cookie_exists": os.path.exists(ORIGINAL_COOKIE)
     }
-
-@app.get("/cache")
-def list_cache():
-    now = time.time()
-    return {
-        vid: {"remaining_sec": int(dur - (now - ts))}
-        for vid, (ts, _, dur) in CACHE.items()
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
