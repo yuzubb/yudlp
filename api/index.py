@@ -4,8 +4,6 @@ import time
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from fastapi.middleware.cors import CORSMiddleware
-import os
-import tempfile
 
 app = FastAPI()
 
@@ -20,12 +18,17 @@ app.add_middleware(
 
 executor = ThreadPoolExecutor()
 
-# 元のクッキーファイルのパス
-ORIGINAL_COOKIE = os.path.join(os.path.dirname(__file__), "youtube-cookies.txt")
+ydl_opts = {
+    "quiet": True,
+    "skip_download": True,
+    "nocheckcertificate": True,
+    "format": "bestvideo+bestaudio/best",
+    "proxy": "http://ytproxy-siawaseok.duckdns.org:3007"
+}
 
 # キャッシュと処理中リスト
 CACHE = {}
-PROCESSING_IDS = set()
+PROCESSING_IDS = set()  # 現在処理中の video_id を保持
 DEFAULT_CACHE_DURATION = 600
 LONG_CACHE_DURATION = 14200
 
@@ -37,10 +40,6 @@ def cleanup_cache():
 
 @app.get("/stream/{video_id}")
 async def get_streams(video_id: str):
-    # クッキーファイルの存在確認
-    if not os.path.exists(ORIGINAL_COOKIE):
-        raise HTTPException(status_code=500, detail="Cookie file not found in API directory.")
-
     current_time = time.time()
     cleanup_cache()
 
@@ -52,28 +51,10 @@ async def get_streams(video_id: str):
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     def fetch_info():
-        # --- 読み取り専用エラー対策: /tmp に一時的なコピーを作成 ---
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as tmp:
-            with open(ORIGINAL_COOKIE, 'r') as f:
-                tmp.write(f.read())
-            temp_cookie_path = tmp.name
+        with YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
 
-        try:
-            ydl_opts = {
-                "quiet": True,
-                "skip_download": True,
-                "nocheckcertificate": True,
-                "format": "bestvideo+bestaudio/best",
-                "cookiefile": temp_cookie_path,
-                "no_cookies_file": True, # 書き込みを行わない設定
-            }
-            with YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        finally:
-            # 使用後に一時ファイルを削除
-            if os.path.exists(temp_cookie_path):
-                os.remove(temp_cookie_path)
-
+    # --- 処理中管理の追加 ---
     PROCESSING_IDS.add(video_id)
     try:
         loop = asyncio.get_event_loop()
@@ -105,16 +86,39 @@ async def get_streams(video_id: str):
         return response_data
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"yt-dlp error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
+        # 成功・失敗に関わらず、終わったら処理中リストから削除
         if video_id in PROCESSING_IDS:
             PROCESSING_IDS.remove(video_id)
 
+# --- 処理状況確認用API ---
 @app.get("/status")
 def get_status():
+    """現在処理中のIDとキャッシュされているIDのサマリーを返す"""
     return {
         "processing_count": len(PROCESSING_IDS),
-        "cache_count": len(CACHE),
-        "cookie_path": ORIGINAL_COOKIE,
-        "cookie_exists": os.path.exists(ORIGINAL_COOKIE)
+        "processing_ids": list(PROCESSING_IDS),
+        "cache_count": len(CACHE)
+    }
+
+@app.delete("/cache/{video_id}")
+def delete_cache(video_id: str):
+    if video_id in CACHE:
+        del CACHE[video_id]
+        return {"status": "success", "message": f"{video_id} のキャッシュを削除しました。"}
+    else:
+        raise HTTPException(status_code=404, detail="指定されたIDのキャッシュは存在しません。")
+
+@app.get("/cache")
+def list_cache():
+    now = time.time()
+    return {
+        vid: {
+            "age_sec": int(now - ts),
+            "remaining_sec": int(dur - (now - ts)),
+            "duration_sec": dur,
+            "is_processing": vid in PROCESSING_IDS  # 個別のキャッシュ情報にも処理中かを入れる
+        }
+        for vid, (ts, _, dur) in CACHE.items()
     }
