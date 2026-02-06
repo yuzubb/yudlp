@@ -15,39 +15,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 並列処理の効率化
 executor = ThreadPoolExecutor(max_workers=20)
 
-# --- 高速化・最適化オプション ---
+# --- yt-dlp 設定 ---
 ydl_opts_base = {
     "quiet": True,
     "no_warnings": True,
     "nocheckcertificate": True,
     "proxy": "http://ytproxy-siawaseok.duckdns.org:3007",
-    "socket_timeout": 7,
-    "extract_flat": "in_playlist",
-    # ネットワークのオーバーヘッドを削る
-    "youtube_include_dash_manifest": False,
-    "youtube_include_hls_manifest": False,
-    "compat_opts": ["no-direct-merge", "manifest-filesize-approx"],
+    "socket_timeout": 10,
 }
 
-# 動画URL取得用（レスポンスを元に戻すために extract_flat は False）
+# 動画URL取得用（マニフェストを含める）
 ydl_opts_video = {
     **ydl_opts_base,
     "extract_flat": False,
     "skip_download": True,
     "format": "bestvideo+bestaudio/best",
+    "youtube_include_dash_manifest": True,  # DASH (.mpd) を取得
+    "youtube_include_hls_manifest": True,   # HLS (.m3u8) を取得
 }
 
-# プレイリスト・チャンネル用（最新50件制限）
+# プレイリスト・チャンネル用
 ydl_opts_flat = {
     **ydl_opts_base,
+    "extract_flat": "in_playlist",
     "playlist_items": "1-50",
     "lazy_playlist": True,
 }
 
-# キャッシュ
 VIDEO_CACHE = {}
 PLAYLIST_CACHE = {}
 CHANNEL_CACHE = {}
@@ -76,7 +72,7 @@ async def get_streams(video_id: str):
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
         
-        # 以前のフォーマットに戻しました
+        # 以前のレスポンス構造を維持しつつ、マニフェストURLも formats に含める
         formats = [
             {
                 "itag": f.get("format_id"),
@@ -85,7 +81,8 @@ async def get_streams(video_id: str):
                 "fps": f.get("fps"),
                 "acodec": f.get("acodec"),
                 "vcodec": f.get("vcodec"),
-                "url": f.get("url")
+                "url": f.get("url"),
+                "manifest_url": f.get("manifest_url") # マニフェスト用フィールドがあれば追加
             }
             for f in info.get("formats", [])
             if f.get("url") and f.get("ext") != "mhtml"
@@ -96,10 +93,11 @@ async def get_streams(video_id: str):
             "id": video_id,
             "uploader": info.get("uploader"),
             "uploader_id": info.get("uploader_id"),
+            "thumbnail": info.get("thumbnail"),
+            "description": info.get("description"),
             "formats": formats
         }
         
-        # フォーマット数が多い場合は長期、少ない場合は短期キャッシュ
         dur = 14200 if len(formats) >= 12 else 600
         VIDEO_CACHE[video_id] = (time.time(), response_data, dur)
         return response_data
@@ -113,7 +111,11 @@ async def get_playlist(playlist_id: str):
         ts, data, dur = PLAYLIST_CACHE[playlist_id]
         if time.time() - ts < dur: return data
 
-    url = f"https://www.youtube.com/watch?list={playlist_id}" if playlist_id.startswith("RD") else f"https://www.youtube.com/playlist?list={playlist_id}"
+    # RD19y8YTbvri8 等のミックスリストに対応するため watch 経由にする
+    if playlist_id.startswith("RD"):
+        url = f"https://www.youtube.com/watch?list={playlist_id}"
+    else:
+        url = f"https://www.youtube.com/playlist?list={playlist_id}"
     
     def fetch():
         with YoutubeDL(ydl_opts_flat) as ydl:
@@ -131,7 +133,12 @@ async def get_playlist(playlist_id: str):
             "thumbnail": e.get("thumbnails", [{}])[-1].get("url") if e.get("thumbnails") else None
         } for e in info.get("entries", []) if e]
 
-        response_data = {"id": playlist_id, "title": info.get("title"), "video_count": len(entries), "entries": entries}
+        response_data = {
+            "id": playlist_id,
+            "title": info.get("title") or "Playlist/Mix",
+            "video_count": len(entries),
+            "entries": entries
+        }
         PLAYLIST_CACHE[playlist_id] = (time.time(), response_data, 14200)
         return response_data
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
@@ -174,13 +181,10 @@ async def get_channel(channel_id: str):
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
     finally: PROCESSING_IDS.discard(channel_id)
 
-# --- 管理用APIの復活 ---
-
 @app.get("/status")
 def get_status():
     return {
         "is_processing": list(PROCESSING_IDS),
-        "processing_count": len(PROCESSING_IDS),
         "cache_stats": {
             "videos": len(VIDEO_CACHE),
             "playlists": len(PLAYLIST_CACHE),
@@ -202,4 +206,4 @@ def clear_cache():
     VIDEO_CACHE.clear()
     PLAYLIST_CACHE.clear()
     CHANNEL_CACHE.clear()
-    return {"message": "Success"}
+    return {"status": "ok"}
