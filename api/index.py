@@ -90,37 +90,57 @@ async def get_streams(video_id: str):
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
     finally: PROCESSING_IDS.discard(video_id)
 
-# --- m3u8 取得用API ---
+
 @app.get("/m3u8/{video_id}")
 async def get_m3u8(video_id: str):
-    """m3u8形式のストリームURLのみを抽出して返す"""
     url = f"https://www.youtube.com/watch?v={video_id}"
     PROCESSING_IDS.add(video_id)
     
     try:
         def fetch():
-            # m3u8(hls)が含まれるようにフォーマットを指定
-            opts = {**ydl_opts_base, "format": "best"}
-            with YoutubeDL(opts) as ydl: return ydl.extract_info(url, download=False)
+            # YouTubeからHLS形式を優先的に取得するためのオプション
+            opts = {
+                **ydl_opts_base,
+                "format": "best",
+                # クライアントをiOSやAndroidに偽装するとm3u8が取得しやすくなる
+                "user_agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+            }
+            with YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
 
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
         
-        # manifest_url または ext='m3u8' のものを抽出
+        # 1. 抽出条件を「プロトコルが m3u8」または「URLに .m3u8 が含まれる」に限定
         m3u8_streams = [
-            {"url": f.get("url"), "resolution": f.get("resolution"), "vcodec": f.get("vcodec")}
+            {
+                "url": f.get("url"),
+                "resolution": f.get("resolution"),
+                "vcodec": f.get("vcodec"),
+                "protocol": f.get("protocol")
+            }
             for f in info.get("formats", [])
-            if "m3u8" in f.get("url", "") or f.get("ext") == "mp4" # yt-dlpのURL判定に準ずる
+            if f.get("protocol") == "m3u8_native" or ".m3u8" in f.get("url", "")
         ]
 
-        if not m3u8_streams:
-            # manifest_urlが直接ある場合（hls_nativeなど）
-            hls_url = info.get("url") if "m3u8" in info.get("url", "") else None
-            if hls_url: m3u8_streams = [{"url": hls_url, "resolution": "auto"}]
+        # 2. streamsが見つからない場合、最上位の manifest_url を確認
+        if not m3u8_streams and info.get("hls_url"):
+            m3u8_streams.append({
+                "url": info.get("hls_url"),
+                "resolution": "multi (manifest)",
+                "vcodec": "various"
+            })
 
-        return {"title": info.get("title"), "video_id": video_id, "m3u8_streams": m3u8_streams}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
-    finally: PROCESSING_IDS.discard(video_id)
+        return {
+            "title": info.get("title"),
+            "video_id": video_id,
+            "m3u8_streams": m3u8_streams
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        PROCESSING_IDS.discard(video_id)
+
 
 # --- プレイリスト情報 ---
 @app.get("/playlist/{playlist_id}")
