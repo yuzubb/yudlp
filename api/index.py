@@ -93,7 +93,7 @@ def delete_cache(item_id: str):
 
 # --- メイン API (動画 / m3u8) ---
 
-@app.get("/api/2/streams/{video_id}")
+@app.get("/stream/{video_id}")
 async def get_streams(video_id: str):
     cleanup_cache()
     if video_id in VIDEO_CACHE:
