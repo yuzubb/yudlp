@@ -18,16 +18,15 @@ app.add_middleware(
 
 executor = ThreadPoolExecutor()
 
-# 基本設定
+# --- yt-dlp 設定 ---
 ydl_opts_base = {
     "quiet": True,
     "skip_download": True,
     "nocheckcertificate": True,
-    "format": "bestvideo+bestaudio/best",
+    "format": "best",
     "proxy": "http://ytproxy-siawaseok.duckdns.org:3007"
 }
 
-# プレイリスト・チャンネル用設定
 ydl_opts_flat = {
     **ydl_opts_base,
     "extract_flat": "in_playlist",
@@ -35,30 +34,65 @@ ydl_opts_flat = {
     "lazy_playlist": True,
 }
 
-# キャッシュと処理中管理
-VIDEO_CACHE = {}      # { video_id: (timestamp, data, duration) }
-PLAYLIST_CACHE = {}   # { playlist_id: (timestamp, data, duration) }
-CHANNEL_CACHE = {}    # { channel_id: (timestamp, data, duration) }
+# --- キャッシュとステータス管理 ---
+VIDEO_CACHE = {}      # { id: (timestamp, data, duration) }
+PLAYLIST_CACHE = {}
+CHANNEL_CACHE = {}
 PROCESSING_IDS = set()
 
 DEFAULT_CACHE_DURATION = 600    # 10分
 LONG_CACHE_DURATION = 14200     # 4時間
 
 def cleanup_cache():
+    """期限切れキャッシュをすべて削除"""
     now = time.time()
     for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE]:
         expired = [k for k, (ts, _, dur) in cache.items() if now - ts >= dur]
         for k in expired:
             del cache[k]
 
-# --- ステータス確認API ---
+# --- ステータス & キャッシュ管理 API ---
+
 @app.get("/status")
 def get_status():
-    """現在処理中のID一覧を返す"""
+    """現在処理中のリクエスト一覧"""
     return {"processing_count": len(PROCESSING_IDS), "processing_ids": list(PROCESSING_IDS)}
 
-# --- 動画ストリーム情報 (既存の拡張) ---
-@app.get("/stream/{video_id}")
+@app.get("/api/2/cache")
+def list_cache():
+    """全カテゴリーのキャッシュ状況を一覧表示"""
+    now = time.time()
+    def format_cache(cache_dict):
+        return {
+            vid: {
+                "age_sec": int(now - ts),
+                "remaining_sec": int(dur - (now - ts)),
+                "duration_sec": dur
+            }
+            for vid, (ts, _, dur) in cache_dict.items()
+        }
+    return {
+        "video": format_cache(VIDEO_CACHE),
+        "playlist": format_cache(PLAYLIST_CACHE),
+        "channel": format_cache(CHANNEL_CACHE)
+    }
+
+@app.delete("/api/2/cache/{item_id}")
+def delete_cache(item_id: str):
+    """指定したIDのキャッシュを全カテゴリから探して削除"""
+    found = False
+    for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE]:
+        if item_id in cache:
+            del cache[item_id]
+            found = True
+    
+    if found:
+        return {"status": "success", "message": f"{item_id} のキャッシュを削除しました。"}
+    raise HTTPException(status_code=404, detail="キャッシュが見つかりませんでした。")
+
+# --- ストリーム取得 API ---
+
+@app.get("/api/2/streams/{video_id}")
 async def get_streams(video_id: str):
     cleanup_cache()
     if video_id in VIDEO_CACHE:
@@ -67,22 +101,17 @@ async def get_streams(video_id: str):
 
     url = f"https://www.youtube.com/watch?v={video_id}"
     PROCESSING_IDS.add(video_id)
-    
     try:
         def fetch():
             with YoutubeDL(ydl_opts_base) as ydl: return ydl.extract_info(url, download=False)
-        
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
-
         formats = [{
             "itag": f.get("format_id"),
             "ext": f.get("ext"),
             "resolution": f.get("resolution"),
-            "fps": f.get("fps"),
             "url": f.get("url")
         } for f in info.get("formats", []) if f.get("url") and f.get("ext") != "mhtml"]
-
         res = {"title": info.get("title"), "id": video_id, "formats": formats}
         dur = LONG_CACHE_DURATION if len(formats) >= 12 else DEFAULT_CACHE_DURATION
         VIDEO_CACHE[video_id] = (time.time(), res, dur)
@@ -90,59 +119,38 @@ async def get_streams(video_id: str):
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
     finally: PROCESSING_IDS.discard(video_id)
 
-
 @app.get("/m3u8/{video_id}")
 async def get_m3u8(video_id: str):
+    """HLS (m3u8) ストリームを確実に取得（iOS UA偽装版）"""
     url = f"https://www.youtube.com/watch?v={video_id}"
     PROCESSING_IDS.add(video_id)
-    
     try:
         def fetch():
-            # YouTubeからHLS形式を優先的に取得するためのオプション
+            # iOSに偽装してHLSプレイリストを強制
             opts = {
                 **ydl_opts_base,
-                "format": "best",
-                # クライアントをiOSやAndroidに偽装するとm3u8が取得しやすくなる
-                "user_agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+                "user_agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"
             }
-            with YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
-
+            with YoutubeDL(opts) as ydl: return ydl.extract_info(url, download=False)
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
         
-        # 1. 抽出条件を「プロトコルが m3u8」または「URLに .m3u8 が含まれる」に限定
+        # フィルタリング
         m3u8_streams = [
-            {
-                "url": f.get("url"),
-                "resolution": f.get("resolution"),
-                "vcodec": f.get("vcodec"),
-                "protocol": f.get("protocol")
-            }
+            {"url": f.get("url"), "resolution": f.get("resolution"), "protocol": f.get("protocol")}
             for f in info.get("formats", [])
             if f.get("protocol") == "m3u8_native" or ".m3u8" in f.get("url", "")
         ]
-
-        # 2. streamsが見つからない場合、最上位の manifest_url を確認
+        # フォールバック
         if not m3u8_streams and info.get("hls_url"):
-            m3u8_streams.append({
-                "url": info.get("hls_url"),
-                "resolution": "multi (manifest)",
-                "vcodec": "various"
-            })
+            m3u8_streams.append({"url": info.get("hls_url"), "resolution": "adaptive", "protocol": "m3u8_native"})
 
-        return {
-            "title": info.get("title"),
-            "video_id": video_id,
-            "m3u8_streams": m3u8_streams
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        PROCESSING_IDS.discard(video_id)
+        return {"title": info.get("title"), "video_id": video_id, "m3u8_streams": m3u8_streams}
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+    finally: PROCESSING_IDS.discard(video_id)
 
+# --- プレイリスト・チャンネル API ---
 
-# --- プレイリスト情報 ---
 @app.get("/playlist/{playlist_id}")
 async def get_playlist(playlist_id: str):
     cleanup_cache()
@@ -150,23 +158,22 @@ async def get_playlist(playlist_id: str):
         ts, data, dur = PLAYLIST_CACHE[playlist_id]
         if time.time() - ts < dur: return data
     
-    url = f"https://www.youtube.com/watch?list={playlist_id}" if playlist_id.startswith("RD") else f"https://www.youtube.com/playlist?list={playlist_id}"
-    PROCESSING_IDS.add(playlist_id)
+    url = f"https://www.youtube.com/playlist?list={playlist_id}"
+    if playlist_id.startswith("RD"): url = f"https://www.youtube.com/watch?list={playlist_id}"
     
+    PROCESSING_IDS.add(playlist_id)
     try:
         def fetch():
             with YoutubeDL(ydl_opts_flat) as ydl: return ydl.extract_info(url, download=False)
-            
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
-        entries = [{"id": e.get("id"), "title": e.get("title"), "uploader": e.get("uploader"), "duration": e.get("duration"), "thumbnail": e.get("thumbnails", [{}])[-1].get("url") if e.get("thumbnails") else None} for e in info.get("entries", []) if e]
-        res = {"id": playlist_id, "title": info.get("title"), "video_count": len(entries), "entries": entries}
+        entries = [{"id": e.get("id"), "title": e.get("title"), "thumbnail": e.get("thumbnails", [{}])[-1].get("url") if e.get("thumbnails") else None} for e in info.get("entries", []) if e]
+        res = {"id": playlist_id, "title": info.get("title"), "entries": entries}
         PLAYLIST_CACHE[playlist_id] = (time.time(), res, 14200)
         return res
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
     finally: PROCESSING_IDS.discard(playlist_id)
 
-# --- チャンネル情報 ---
 @app.get("/channel/{channel_id}")
 async def get_channel(channel_id: str):
     cleanup_cache()
@@ -176,15 +183,13 @@ async def get_channel(channel_id: str):
     
     url = f"https://www.youtube.com/{channel_id}/videos" if channel_id.startswith("@") else f"https://www.youtube.com/channel/{channel_id}/videos"
     PROCESSING_IDS.add(channel_id)
-    
     try:
         def fetch():
             with YoutubeDL(ydl_opts_flat) as ydl: return ydl.extract_info(url, download=False)
-            
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
-        videos = [{"id": e.get("id"), "title": e.get("title"), "view_count": e.get("view_count"), "thumbnail": e.get("thumbnails", [{}])[-1].get("url") if e.get("thumbnails") else None} for e in info.get("entries", []) if e]
-        res = {"channel_id": info.get("id"), "name": info.get("channel") or info.get("uploader"), "description": info.get("description"), "subscribers": info.get("subscriber_count"), "video_count": len(videos), "videos": videos}
+        videos = [{"id": e.get("id"), "title": e.get("title"), "view_count": e.get("view_count")} for e in info.get("entries", []) if e]
+        res = {"channel_id": info.get("id"), "name": info.get("uploader"), "videos": videos}
         CHANNEL_CACHE[channel_id] = (time.time(), res, 86400)
         return res
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
