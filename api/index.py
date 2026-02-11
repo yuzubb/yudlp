@@ -1,9 +1,10 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from yt_dlp import YoutubeDL
 import time
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 
 app = FastAPI()
 
@@ -128,14 +129,11 @@ async def get_streams(video_id: str):
 
 @app.get("/m3u8/{video_id}")
 async def get_m3u8(video_id: str):
-    """
-    iOSのUser-Agentを使用してHLS(m3u8)マニフェストURLを抽出する
-    """
+    """iOSのUser-Agentを使用してHLS(m3u8)マニフェストURLを抽出"""
     url = f"https://www.youtube.com/watch?v={video_id}"
     PROCESSING_IDS.add(video_id)
     try:
         def fetch():
-            # HLSを誘発するためにモバイルUAを使用
             opts = {
                 **ydl_opts_base,
                 "user_agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"
@@ -146,7 +144,6 @@ async def get_m3u8(video_id: str):
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
         
-        # protocolがm3u8またはURLにm3u8が含まれるものを抽出
         streams = [
             {
                 "url": f.get("url"),
@@ -158,7 +155,6 @@ async def get_m3u8(video_id: str):
             if f.get("protocol") == "m3u8_native" or ".m3u8" in f.get("url", "")
         ]
 
-        # 取得できない場合のフォールバック
         if not streams and info.get("hls_url"):
             streams.append({
                 "url": info.get("hls_url"),
@@ -180,15 +176,30 @@ async def get_m3u8(video_id: str):
 # --- プレイリスト / チャンネル API ---
 
 @app.get("/playlist/{playlist_id}")
-async def get_playlist(playlist_id: str):
+async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
+    """
+    プレイリスト情報を取得。
+    RDから始まるIDの場合は、vパラメータ(動画ID)を付与したURLを使用する。
+    """
     cleanup_cache()
-    if playlist_id in PLAYLIST_CACHE:
-        ts, data, dur = PLAYLIST_CACHE[playlist_id]
+    # キャッシュキーにはvを含める（Mixリストの内容は起点動画で変わるため）
+    cache_key = f"{playlist_id}_{v}" if v else playlist_id
+    
+    if cache_key in PLAYLIST_CACHE:
+        ts, data, dur = PLAYLIST_CACHE[cache_key]
         if time.time() - ts < dur: return data
     
-    url = f"https://www.youtube.com/playlist?list={playlist_id}"
+    # URL構築のロジック
     if playlist_id.startswith("RD"):
-        url = f"https://www.youtube.com/watch?list={playlist_id}"
+        if v:
+            # RDかつ動画IDあり: watch?v=ID&list=RD...
+            url = f"https://www.youtube.com/watch?v={v}&list={playlist_id}"
+        else:
+            # RDかつ動画IDなし: watch?list=RD...
+            url = f"https://www.youtube.com/watch?list={playlist_id}"
+    else:
+        # 通常のプレイリスト: playlist?list=...
+        url = f"https://www.youtube.com/playlist?list={playlist_id}"
     
     PROCESSING_IDS.add(playlist_id)
     try:
@@ -198,6 +209,7 @@ async def get_playlist(playlist_id: str):
         
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
+        
         entries = [
             {
                 "id": e.get("id"),
@@ -205,8 +217,17 @@ async def get_playlist(playlist_id: str):
                 "thumbnail": e.get("thumbnails", [{}])[-1].get("url") if e.get("thumbnails") else None
             } for e in info.get("entries", []) if e
         ]
-        res = {"id": playlist_id, "title": info.get("title"), "video_count": len(entries), "entries": entries}
-        PLAYLIST_CACHE[playlist_id] = (time.time(), res, 14200)
+        
+        res = {
+            "id": playlist_id, 
+            "title": info.get("title"), 
+            "video_count": len(entries), 
+            "entries": entries
+        }
+        
+        # Mixリストは内容が変わりやすいため、キャッシュ時間を通常の半分(約2時間)に設定
+        cache_dur = 7200 if playlist_id.startswith("RD") else 14200
+        PLAYLIST_CACHE[cache_key] = (time.time(), res, cache_dur)
         return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -244,3 +265,7 @@ async def get_channel(channel_id: str):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         PROCESSING_IDS.discard(channel_id)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
