@@ -127,15 +127,21 @@ async def get_channel_streams(channel_id: str):
         for e in entries:
             if not e: continue
             
+            status = e.get("live_status")
+            is_live = status == "live"
+            is_upcoming = status == "upcoming" or e.get("availability") == "upcoming"
+            
+            viewers = e.get("concurrent_view_count") or e.get("view_count") or 0
+            
             streams.append({
                 "id": e.get("id"),
                 "title": e.get("title"),
-                "status": e.get("live_status"),
-                "viewers": e.get("concurrent_view_count"),
+                "status": "live" if is_live else "upcoming" if is_upcoming else "archived",
+                "viewers": int(viewers),
                 "scheduled_start": e.get("release_timestamp") or e.get("timestamp"),
                 "thumbnail": get_best_thumbnail(e.get("thumbnails")),
-                "is_live": e.get("live_status") == "live",
-                "is_upcoming": e.get("live_status") == "upcoming"
+                "is_live": is_live,
+                "is_upcoming": is_upcoming
             })
 
         return {
