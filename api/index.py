@@ -112,11 +112,11 @@ async def get_channel_streams(channel_id: str):
         def fetch():
             opts = {
                 **ydl_opts_base,
-                "extract_flat": "in_playlist",
-                "force_generic_extractor": False,
+                "extract_flat": False,
+                "playlist_items": "1-50",
             }
             with YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False, process=True)
+                return ydl.extract_info(url, download=False)
 
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
