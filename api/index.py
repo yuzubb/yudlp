@@ -97,83 +97,54 @@ async def get_streams(video_id: str):
     finally:
         PROCESSING_IDS.discard(video_id)
 
-@app.get("/m3u8/{video_id}")
-async def get_m3u8(video_id: str):
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    PROCESSING_IDS.add(video_id)
-    try:
-        def fetch():
-            opts = {**ydl_opts_base, "user_agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"}
-            with YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
-
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(executor, fetch)
-        
-        streams = [{"url": f.get("url"), "resolution": f.get("resolution"), "protocol": f.get("protocol"), "ext": f.get("ext")}
-                   for f in info.get("formats", []) if f.get("protocol") == "m3u8_native" or ".m3u8" in f.get("url", "")]
-
-        if not streams and info.get("hls_url"):
-            streams.append({"url": info.get("hls_url"), "resolution": "adaptive", "protocol": "m3u8_native", "ext": "m3u8"})
-
-        return {"title": info.get("title"), "video_id": video_id, "m3u8_streams": streams}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        PROCESSING_IDS.discard(video_id)
-
-@app.get("/channel/home/{channel_id}")
-async def get_channel_home(channel_id: str):
+@app.get("/channel/streams/{channel_id}")
+async def get_channel_streams(channel_id: str):
     cleanup_cache()
-    cache_key = f"home_{channel_id}"
-    if cache_key in CHANNEL_CACHE:
-        ts, data, dur = CHANNEL_CACHE[cache_key]
-        if time.time() - ts < dur: return data
-
-    if channel_id.startswith("UC"):
-        url = f"https://www.youtube.com/channel/{channel_id}"
-    elif channel_id.startswith("@"):
-        url = f"https://www.youtube.com/{channel_id}"
-    else:
-        url = f"https://www.youtube.com/channel/{channel_id}"
     
-    PROCESSING_IDS.add(cache_key)
+    if channel_id.startswith("UC"):
+        url = f"https://www.youtube.com/channel/{channel_id}/streams"
+    elif channel_id.startswith("@"):
+        url = f"https://www.youtube.com/{channel_id}/streams"
+    else:
+        url = f"https://www.youtube.com/channel/{channel_id}/streams"
+
     try:
         def fetch():
             opts = {
                 **ydl_opts_base,
-                "extract_flat": True,
-                "playlist_items": "1",
+                "extract_flat": "in_playlist",
+                "force_generic_extractor": False,
             }
             with YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        
+                return ydl.extract_info(url, download=False, process=True)
+
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
         
-        sub_count = info.get("channel_follower_count") or info.get("subscriber_count")
-        
-        featured_video = None
+        streams = []
         entries = info.get("entries", [])
-        if entries and len(entries) > 0:
-            featured_video = entries[0].get("id")
-
-        res = {
-            "id": info.get("id") or channel_id,
-            "name": info.get("channel") or info.get("uploader") or info.get("title"),
-            "subscriber_count": sub_count,
-            "description": info.get("description"),
-            "avatar": get_best_thumbnail(info.get("thumbnails")),
-            "banner": info.get("thumbnails")[-1].get("url") if info.get("thumbnails") else None,
-            "featured_video": featured_video
-        }
         
-        CHANNEL_CACHE[cache_key] = (time.time(), res, CHANNEL_CACHE_DURATION)
-        return res
+        for e in entries:
+            if not e: continue
+            
+            streams.append({
+                "id": e.get("id"),
+                "title": e.get("title"),
+                "status": e.get("live_status"),
+                "viewers": e.get("concurrent_view_count"),
+                "scheduled_start": e.get("release_timestamp") or e.get("timestamp"),
+                "thumbnail": get_best_thumbnail(e.get("thumbnails")),
+                "is_live": e.get("live_status") == "live",
+                "is_upcoming": e.get("live_status") == "upcoming"
+            })
+
+        return {
+            "channel": info.get("uploader") or info.get("title") or channel_id,
+            "channel_id": info.get("id"),
+            "streams": streams
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch home: {str(e)}")
-    finally:
-        PROCESSING_IDS.discard(cache_key)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch streams: {str(e)}")
 
 @app.get("/channel/{channel_id}")
 async def get_channel_videos(channel_id: str):
@@ -260,8 +231,10 @@ async def get_shorts(channel_id: str):
     cleanup_cache()
     if channel_id.startswith("UC"):
         url = f"https://www.youtube.com/channel/{channel_id}/shorts"
-    else:
+    elif channel_id.startswith("@"):
         url = f"https://www.youtube.com/{channel_id}/shorts"
+    else:
+        url = f"https://www.youtube.com/channel/{channel_id}/shorts"
     try:
         def fetch():
             with YoutubeDL(ydl_opts_flat) as ydl:
