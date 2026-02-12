@@ -173,7 +173,7 @@ async def get_m3u8(video_id: str):
     finally:
         PROCESSING_IDS.discard(video_id)
 
-# --- プレイリスト / チャンネル API ---
+# --- プレイリスト / チャンネル / ショート API ---
 
 @app.get("/playlist/{playlist_id}")
 async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
@@ -182,23 +182,15 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
     RDから始まるIDの場合は、vパラメータ(動画ID)を付与したURLを使用する。
     """
     cleanup_cache()
-    # キャッシュキーにはvを含める（Mixリストの内容は起点動画で変わるため）
     cache_key = f"{playlist_id}_{v}" if v else playlist_id
     
     if cache_key in PLAYLIST_CACHE:
         ts, data, dur = PLAYLIST_CACHE[cache_key]
         if time.time() - ts < dur: return data
     
-    # URL構築のロジック
     if playlist_id.startswith("RD"):
-        if v:
-            # RDかつ動画IDあり: watch?v=ID&list=RD...
-            url = f"https://www.youtube.com/watch?v={v}&list={playlist_id}"
-        else:
-            # RDかつ動画IDなし: watch?list=RD...
-            url = f"https://www.youtube.com/watch?list={playlist_id}"
+        url = f"https://www.youtube.com/watch?v={v}&list={playlist_id}" if v else f"https://www.youtube.com/watch?list={playlist_id}"
     else:
-        # 通常のプレイリスト: playlist?list=...
         url = f"https://www.youtube.com/playlist?list={playlist_id}"
     
     PROCESSING_IDS.add(playlist_id)
@@ -225,7 +217,6 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
             "entries": entries
         }
         
-        # Mixリストは内容が変わりやすいため、キャッシュ時間を通常の半分(約2時間)に設定
         cache_dur = 7200 if playlist_id.startswith("RD") else 14200
         PLAYLIST_CACHE[cache_key] = (time.time(), res, cache_dur)
         return res
@@ -234,8 +225,56 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
     finally:
         PROCESSING_IDS.discard(playlist_id)
 
+@app.get("/short/{channel_id}")
+async def get_shorts(channel_id: str):
+    """
+    チャンネルのショート動画一覧を最大50件取得。
+    @ID または チャンネルID を受け取ります。
+    """
+    cleanup_cache()
+    cache_key = f"shorts_{channel_id}"
+    if cache_key in CHANNEL_CACHE:
+        ts, data, dur = CHANNEL_CACHE[cache_key]
+        if time.time() - ts < dur: return data
+
+    # チャンネルURLの構築
+    base_path = channel_id if channel_id.startswith("@") else f"channel/{channel_id}"
+    url = f"https://www.youtube.com/{base_path}/shorts"
+    
+    PROCESSING_IDS.add(cache_key)
+    try:
+        def fetch():
+            with YoutubeDL(ydl_opts_flat) as ydl:
+                return ydl.extract_info(url, download=False)
+        
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(executor, fetch)
+        
+        shorts = [
+            {
+                "id": e.get("id"),
+                "title": e.get("title"),
+                "thumbnail": e.get("thumbnails", [{}])[-1].get("url") if e.get("thumbnails") else None,
+                "view_count": e.get("view_count")
+            } for e in info.get("entries", []) if e
+        ]
+        
+        res = {
+            "channel_id": info.get("id"),
+            "name": info.get("uploader") or info.get("channel"),
+            "shorts": shorts
+        }
+        # 24時間キャッシュ
+        CHANNEL_CACHE[cache_key] = (time.time(), res, 86400)
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        PROCESSING_IDS.discard(cache_key)
+
 @app.get("/channel/{channel_id}")
 async def get_channel(channel_id: str):
+    """チャンネルの動画一覧と説明を取得"""
     cleanup_cache()
     if channel_id in CHANNEL_CACHE:
         ts, data, dur = CHANNEL_CACHE[channel_id]
@@ -251,6 +290,7 @@ async def get_channel(channel_id: str):
         
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
+        
         videos = [
             {
                 "id": e.get("id"),
@@ -258,7 +298,14 @@ async def get_channel(channel_id: str):
                 "view_count": e.get("view_count")
             } for e in info.get("entries", []) if e
         ]
-        res = {"channel_id": info.get("id"), "name": info.get("uploader") or info.get("channel"), "videos": videos}
+        
+        res = {
+            "channel_id": info.get("id"), 
+            "name": info.get("uploader") or info.get("channel"), 
+            "description": info.get("description"), # チャンネル説明の追加
+            "videos": videos
+        }
+        # 24時間キャッシュ
         CHANNEL_CACHE[channel_id] = (time.time(), res, 86400)
         return res
     except Exception as e:
