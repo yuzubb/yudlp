@@ -17,7 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-executor = ThreadPoolExecutor()
+executor = ThreadPoolExecutor(max_workers=20)
 
 # --- yt-dlp 基本設定 ---
 ydl_opts_base = {
@@ -25,30 +25,31 @@ ydl_opts_base = {
     "skip_download": True,
     "nocheckcertificate": True,
     "format": "best",
-    "proxy": "http://ytproxy-siawaseok.duckdns.org:3007"
+    "proxy": "http://ytproxy-siawaseok.duckdns.org:3007",
+    "extract_flat": False, # メタデータ取得時はFalseにする
 }
 
 ydl_opts_flat = {
-    **ydl_opts_base,
+    "quiet": True,
+    "skip_download": True,
+    "nocheckcertificate": True,
     "extract_flat": "in_playlist",
     "playlist_items": "1-50",
     "lazy_playlist": True,
+    "proxy": "http://ytproxy-siawaseok.duckdns.org:3007"
 }
 
 # --- キャッシュ & 処理中管理 ---
-# 構造: { id: (取得時刻, データ本体, 有効期間秒) }
 VIDEO_CACHE = {}      
 PLAYLIST_CACHE = {}
 CHANNEL_CACHE = {}
 PROCESSING_IDS = set()
 
-# キャッシュ時間設定
-DEFAULT_CACHE_DURATION = 600    # 10分
-LONG_CACHE_DURATION = 14200     # 4時間
-CHANNEL_CACHE_DURATION = 86400  # 24時間
+DEFAULT_CACHE_DURATION = 600    
+LONG_CACHE_DURATION = 14200     
+CHANNEL_CACHE_DURATION = 86400  
 
 def cleanup_cache():
-    """期限切れのキャッシュを削除"""
     now = time.time()
     for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE]:
         expired = [k for k, (ts, _, dur) in cache.items() if now - ts >= dur]
@@ -123,7 +124,6 @@ async def get_streams(video_id: str):
         } for f in info.get("formats", []) if f.get("url") and f.get("ext") != "mhtml"]
 
         res = {"title": info.get("title"), "id": video_id, "formats": formats}
-        # フォーマット数が多い場合は人気動画とみなし、長めにキャッシュ
         dur = LONG_CACHE_DURATION if len(formats) >= 12 else DEFAULT_CACHE_DURATION
         VIDEO_CACHE[video_id] = (time.time(), res, dur)
         return res
@@ -229,29 +229,36 @@ async def get_channel(channel_id: str):
         ts, data, dur = CHANNEL_CACHE[channel_id]
         if time.time() - ts < dur: return data
     
-    url = f"https://www.youtube.com/{channel_id}/videos" if channel_id.startswith("@") else f"https://www.youtube.com/channel/{channel_id}/videos"
+    base_url = f"https://www.youtube.com/{channel_id}" if channel_id.startswith("@") else f"https://www.youtube.com/channel/{channel_id}"
+    videos_url = f"{base_url}/videos"
     
     PROCESSING_IDS.add(channel_id)
     try:
-        def fetch():
+        def fetch_data():
+            # 登録者数などメタデータ取得用 (process=Falseで高速化)
+            with YoutubeDL(ydl_opts_base) as ydl:
+                meta = ydl.extract_info(base_url, download=False, process=False)
+            # 動画リスト取得用
             with YoutubeDL(ydl_opts_flat) as ydl:
-                return ydl.extract_info(url, download=False)
+                videos = ydl.extract_info(videos_url, download=False)
+            return meta, videos
         
         loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(executor, fetch)
+        meta_info, video_info = await loop.run_in_executor(executor, fetch_data)
         
-        # メタデータの抽出
-        thumbnails = info.get("thumbnails", [])
+        # 登録者数は 'channel_follower_count' か 'subscriber_count' に入る
+        sub_count = meta_info.get("channel_follower_count") or meta_info.get("subscriber_count")
+        
         res = {
-            "channel_id": info.get("id"),
-            "name": info.get("uploader") or info.get("channel"),
-            "description": info.get("description"),
-            "subscriber_count": info.get("subscriber_count"),
-            "avatar": thumbnails[0].get("url") if thumbnails else None,
-            "banner": thumbnails[-1].get("url") if thumbnails else None,
+            "channel_id": meta_info.get("id") or video_info.get("id"),
+            "name": meta_info.get("channel") or meta_info.get("uploader") or video_info.get("uploader"),
+            "description": meta_info.get("description"),
+            "subscriber_count": sub_count,
+            "avatar": get_best_thumbnail(meta_info.get("thumbnails")),
+            "banner": meta_info.get("thumbnails")[-1].get("url") if meta_info.get("thumbnails") else None,
             "videos": [{"id": e.get("id"), "title": e.get("title"), "view_count": e.get("view_count"), 
                         "thumbnail": get_best_thumbnail(e.get("thumbnails")), "duration": e.get("duration")}
-                       for e in info.get("entries", []) if e]
+                       for e in video_info.get("entries", []) if e]
         }
         
         CHANNEL_CACHE[channel_id] = (time.time(), res, CHANNEL_CACHE_DURATION)
@@ -264,4 +271,3 @@ async def get_channel(channel_id: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
