@@ -36,27 +36,33 @@ ydl_opts_flat = {
 }
 
 # --- キャッシュ & 処理中管理 ---
-VIDEO_CACHE = {}      # { id: (timestamp, data, duration) }
+# 構造: { id: (取得時刻, データ本体, 有効期間秒) }
+VIDEO_CACHE = {}      
 PLAYLIST_CACHE = {}
 CHANNEL_CACHE = {}
 PROCESSING_IDS = set()
 
+# キャッシュ時間設定
 DEFAULT_CACHE_DURATION = 600    # 10分
 LONG_CACHE_DURATION = 14200     # 4時間
+CHANNEL_CACHE_DURATION = 86400  # 24時間
 
 def cleanup_cache():
-    """期限切れのキャッシュをクリーンアップ"""
+    """期限切れのキャッシュを削除"""
     now = time.time()
     for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE]:
         expired = [k for k, (ts, _, dur) in cache.items() if now - ts >= dur]
         for k in expired:
             del cache[k]
 
+def get_best_thumbnail(thumbnails):
+    if not thumbnails: return None
+    return thumbnails[-1].get("url")
+
 # --- システム・管理 API ---
 
 @app.get("/status")
 def get_status():
-    """現在非同期処理中のID一覧を返す"""
     return {
         "processing_count": len(PROCESSING_IDS),
         "processing_ids": list(PROCESSING_IDS)
@@ -64,7 +70,6 @@ def get_status():
 
 @app.get("/api/2/cache")
 def list_cache():
-    """すべてのキャッシュ状況をカテゴリ別に表示"""
     now = time.time()
     def format_map(c):
         return {
@@ -82,7 +87,6 @@ def list_cache():
 
 @app.delete("/api/2/cache/{item_id}")
 def delete_cache(item_id: str):
-    """指定したIDのキャッシュを削除"""
     deleted = False
     for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE]:
         if item_id in cache:
@@ -119,6 +123,7 @@ async def get_streams(video_id: str):
         } for f in info.get("formats", []) if f.get("url") and f.get("ext") != "mhtml"]
 
         res = {"title": info.get("title"), "id": video_id, "formats": formats}
+        # フォーマット数が多い場合は人気動画とみなし、長めにキャッシュ
         dur = LONG_CACHE_DURATION if len(formats) >= 12 else DEFAULT_CACHE_DURATION
         VIDEO_CACHE[video_id] = (time.time(), res, dur)
         return res
@@ -129,45 +134,24 @@ async def get_streams(video_id: str):
 
 @app.get("/m3u8/{video_id}")
 async def get_m3u8(video_id: str):
-    """iOSのUser-Agentを使用してHLS(m3u8)マニフェストURLを抽出"""
     url = f"https://www.youtube.com/watch?v={video_id}"
     PROCESSING_IDS.add(video_id)
     try:
         def fetch():
-            opts = {
-                **ydl_opts_base,
-                "user_agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"
-            }
+            opts = {**ydl_opts_base, "user_agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"}
             with YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
 
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
         
-        streams = [
-            {
-                "url": f.get("url"),
-                "resolution": f.get("resolution"),
-                "protocol": f.get("protocol"),
-                "ext": f.get("ext")
-            }
-            for f in info.get("formats", [])
-            if f.get("protocol") == "m3u8_native" or ".m3u8" in f.get("url", "")
-        ]
+        streams = [{"url": f.get("url"), "resolution": f.get("resolution"), "protocol": f.get("protocol"), "ext": f.get("ext")}
+                   for f in info.get("formats", []) if f.get("protocol") == "m3u8_native" or ".m3u8" in f.get("url", "")]
 
         if not streams and info.get("hls_url"):
-            streams.append({
-                "url": info.get("hls_url"),
-                "resolution": "adaptive",
-                "protocol": "m3u8_native",
-                "ext": "m3u8"
-            })
+            streams.append({"url": info.get("hls_url"), "resolution": "adaptive", "protocol": "m3u8_native", "ext": "m3u8"})
 
-        return {
-            "title": info.get("title"),
-            "video_id": video_id,
-            "m3u8_streams": streams
-        }
+        return {"title": info.get("title"), "video_id": video_id, "m3u8_streams": streams}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -177,13 +161,8 @@ async def get_m3u8(video_id: str):
 
 @app.get("/playlist/{playlist_id}")
 async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
-    """
-    プレイリスト情報を取得。
-    RDから始まるIDの場合は、vパラメータ(動画ID)を付与したURLを使用する。
-    """
     cleanup_cache()
     cache_key = f"{playlist_id}_{v}" if v else playlist_id
-    
     if cache_key in PLAYLIST_CACHE:
         ts, data, dur = PLAYLIST_CACHE[cache_key]
         if time.time() - ts < dur: return data
@@ -201,23 +180,11 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
         
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
+        entries = [{"id": e.get("id"), "title": e.get("title"), "thumbnail": get_best_thumbnail(e.get("thumbnails"))}
+                   for e in info.get("entries", []) if e]
         
-        entries = [
-            {
-                "id": e.get("id"),
-                "title": e.get("title"),
-                "thumbnail": e.get("thumbnails", [{}])[-1].get("url") if e.get("thumbnails") else None
-            } for e in info.get("entries", []) if e
-        ]
-        
-        res = {
-            "id": playlist_id, 
-            "title": info.get("title"), 
-            "video_count": len(entries), 
-            "entries": entries
-        }
-        
-        cache_dur = 7200 if playlist_id.startswith("RD") else 14200
+        res = {"id": playlist_id, "title": info.get("title"), "video_count": len(entries), "entries": entries}
+        cache_dur = 7200 if playlist_id.startswith("RD") else LONG_CACHE_DURATION
         PLAYLIST_CACHE[cache_key] = (time.time(), res, cache_dur)
         return res
     except Exception as e:
@@ -227,17 +194,12 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
 
 @app.get("/short/{channel_id}")
 async def get_shorts(channel_id: str):
-    """
-    チャンネルのショート動画一覧を最大50件取得。
-    @ID または チャンネルID を受け取ります。
-    """
     cleanup_cache()
     cache_key = f"shorts_{channel_id}"
     if cache_key in CHANNEL_CACHE:
         ts, data, dur = CHANNEL_CACHE[cache_key]
         if time.time() - ts < dur: return data
 
-    # チャンネルURLの構築
     base_path = channel_id if channel_id.startswith("@") else f"channel/{channel_id}"
     url = f"https://www.youtube.com/{base_path}/shorts"
     
@@ -249,23 +211,11 @@ async def get_shorts(channel_id: str):
         
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
+        shorts = [{"id": e.get("id"), "title": e.get("title"), "thumbnail": get_best_thumbnail(e.get("thumbnails")), "view_count": e.get("view_count")}
+                  for e in info.get("entries", []) if e]
         
-        shorts = [
-            {
-                "id": e.get("id"),
-                "title": e.get("title"),
-                "thumbnail": e.get("thumbnails", [{}])[-1].get("url") if e.get("thumbnails") else None,
-                "view_count": e.get("view_count")
-            } for e in info.get("entries", []) if e
-        ]
-        
-        res = {
-            "channel_id": info.get("id"),
-            "name": info.get("uploader") or info.get("channel"),
-            "shorts": shorts
-        }
-        # 24時間キャッシュ
-        CHANNEL_CACHE[cache_key] = (time.time(), res, 86400)
+        res = {"channel_id": info.get("id"), "name": info.get("uploader") or info.get("channel"), "shorts": shorts}
+        CHANNEL_CACHE[cache_key] = (time.time(), res, CHANNEL_CACHE_DURATION)
         return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -274,7 +224,6 @@ async def get_shorts(channel_id: str):
 
 @app.get("/channel/{channel_id}")
 async def get_channel(channel_id: str):
-    """チャンネルの動画一覧と説明を取得"""
     cleanup_cache()
     if channel_id in CHANNEL_CACHE:
         ts, data, dur = CHANNEL_CACHE[channel_id]
@@ -291,22 +240,21 @@ async def get_channel(channel_id: str):
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
         
-        videos = [
-            {
-                "id": e.get("id"),
-                "title": e.get("title"),
-                "view_count": e.get("view_count")
-            } for e in info.get("entries", []) if e
-        ]
-        
+        # メタデータの抽出
+        thumbnails = info.get("thumbnails", [])
         res = {
-            "channel_id": info.get("id"), 
-            "name": info.get("uploader") or info.get("channel"), 
-            "description": info.get("description"), # チャンネル説明の追加
-            "videos": videos
+            "channel_id": info.get("id"),
+            "name": info.get("uploader") or info.get("channel"),
+            "description": info.get("description"),
+            "subscriber_count": info.get("subscriber_count"),
+            "avatar": thumbnails[0].get("url") if thumbnails else None,
+            "banner": thumbnails[-1].get("url") if thumbnails else None,
+            "videos": [{"id": e.get("id"), "title": e.get("title"), "view_count": e.get("view_count"), 
+                        "thumbnail": get_best_thumbnail(e.get("thumbnails")), "duration": e.get("duration")}
+                       for e in info.get("entries", []) if e]
         }
-        # 24時間キャッシュ
-        CHANNEL_CACHE[channel_id] = (time.time(), res, 86400)
+        
+        CHANNEL_CACHE[channel_id] = (time.time(), res, CHANNEL_CACHE_DURATION)
         return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -316,3 +264,4 @@ async def get_channel(channel_id: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
