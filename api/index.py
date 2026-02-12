@@ -25,6 +25,8 @@ ydl_opts_base = {
     "format": "best",
     "proxy": "http://ytproxy-siawaseok.duckdns.org:3007",
     "extract_flat": False,
+    "ignore_no_formats_error": True,  # 配信前エラーを無視
+    "ignoreerrors": True              # 一部の動画の取得失敗を飛ばして続行
 }
 
 ydl_opts_flat = {
@@ -34,7 +36,8 @@ ydl_opts_flat = {
     "extract_flat": "in_playlist",
     "playlist_items": "1-50",
     "lazy_playlist": True,
-    "proxy": "http://ytproxy-siawaseok.duckdns.org:3007"
+    "proxy": "http://ytproxy-siawaseok.duckdns.org:3007",
+    "ignore_no_formats_error": True
 }
 
 VIDEO_CACHE = {}      
@@ -80,7 +83,8 @@ async def get_streams(video_id: str):
         
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
-        
+        if not info: raise Exception("No info found")
+
         formats = [{
             "itag": f.get("format_id"),
             "ext": f.get("ext"),
@@ -122,7 +126,7 @@ async def get_channel_streams(channel_id: str):
         info = await loop.run_in_executor(executor, fetch)
         
         streams = []
-        entries = info.get("entries", [])
+        entries = info.get("entries", []) if info else []
         
         for e in entries:
             if not e: continue
@@ -131,7 +135,8 @@ async def get_channel_streams(channel_id: str):
             is_live = status == "live"
             is_upcoming = status == "upcoming" or e.get("availability") == "upcoming"
             
-            viewers = e.get("concurrent_view_count") or e.get("view_count") or 0
+            # 待機人数(waiting_count)または視聴者数(concurrent_view_count)を取得
+            viewers = e.get("concurrent_view_count") or e.get("waiting_count") or 0
             
             streams.append({
                 "id": e.get("id"),
@@ -145,8 +150,8 @@ async def get_channel_streams(channel_id: str):
             })
 
         return {
-            "channel": info.get("uploader") or info.get("title") or channel_id,
-            "channel_id": info.get("id"),
+            "channel": info.get("uploader") or info.get("title") if info else channel_id,
+            "channel_id": info.get("id") if info else None,
             "streams": streams
         }
     except Exception as e:
