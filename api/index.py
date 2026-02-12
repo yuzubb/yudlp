@@ -130,28 +130,42 @@ async def get_channel_home(channel_id: str):
         ts, data, dur = CHANNEL_CACHE[cache_key]
         if time.time() - ts < dur: return data
 
-    url = f"https://www.youtube.com/{channel_id}"
+    if channel_id.startswith("UC"):
+        url = f"https://www.youtube.com/channel/{channel_id}"
+    elif channel_id.startswith("@"):
+        url = f"https://www.youtube.com/{channel_id}"
+    else:
+        url = f"https://www.youtube.com/channel/{channel_id}"
     
     PROCESSING_IDS.add(cache_key)
     try:
         def fetch():
-            opts = {**ydl_opts_base, "ignore_no_formats_error": True}
+            opts = {
+                **ydl_opts_base,
+                "extract_flat": True,
+                "playlist_items": "1",
+            }
             with YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False, process=True)
+                return ydl.extract_info(url, download=False)
         
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
         
         sub_count = info.get("channel_follower_count") or info.get("subscriber_count")
         
+        featured_video = None
+        entries = info.get("entries", [])
+        if entries and len(entries) > 0:
+            featured_video = entries[0].get("id")
+
         res = {
-            "id": info.get("id"),
-            "name": info.get("channel") or info.get("uploader"),
+            "id": info.get("id") or channel_id,
+            "name": info.get("channel") or info.get("uploader") or info.get("title"),
             "subscriber_count": sub_count,
             "description": info.get("description"),
             "avatar": get_best_thumbnail(info.get("thumbnails")),
             "banner": info.get("thumbnails")[-1].get("url") if info.get("thumbnails") else None,
-            "featured_video": info.get("entries")[0].get("id") if info.get("entries") and isinstance(info.get("entries"), list) else None
+            "featured_video": featured_video
         }
         
         CHANNEL_CACHE[cache_key] = (time.time(), res, CHANNEL_CACHE_DURATION)
@@ -168,7 +182,13 @@ async def get_channel_videos(channel_id: str):
         ts, data, dur = CHANNEL_CACHE[channel_id]
         if time.time() - ts < dur: return data
     
-    base_url = f"https://www.youtube.com/{channel_id}"
+    if channel_id.startswith("UC"):
+        base_url = f"https://www.youtube.com/channel/{channel_id}"
+    elif channel_id.startswith("@"):
+        base_url = f"https://www.youtube.com/{channel_id}"
+    else:
+        base_url = f"https://www.youtube.com/channel/{channel_id}"
+        
     videos_url = f"{base_url}/videos"
     
     PROCESSING_IDS.add(channel_id)
@@ -238,7 +258,10 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
 @app.get("/short/{channel_id}")
 async def get_shorts(channel_id: str):
     cleanup_cache()
-    url = f"https://www.youtube.com/{channel_id}/shorts"
+    if channel_id.startswith("UC"):
+        url = f"https://www.youtube.com/channel/{channel_id}/shorts"
+    else:
+        url = f"https://www.youtube.com/{channel_id}/shorts"
     try:
         def fetch():
             with YoutubeDL(ydl_opts_flat) as ydl:
