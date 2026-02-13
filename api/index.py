@@ -16,6 +16,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 並列処理のワーカー数を維持
 executor = ThreadPoolExecutor(max_workers=30)
 
 ydl_opts_base = {
@@ -35,10 +36,6 @@ CHANNEL_CACHE = {}
 STREAMS_CACHE = {}
 PROCESSING_IDS = set()
 
-DEFAULT_CACHE_DURATION = 600    
-LONG_CACHE_DURATION = 14200     
-CHANNEL_CACHE_DURATION = 86400  
-
 def cleanup_cache():
     now = time.time()
     for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE, STREAMS_CACHE]:
@@ -55,7 +52,6 @@ def get_status():
     return {
         "status": "operational",
         "processing_count": len(PROCESSING_IDS),
-        "processing_ids": list(PROCESSING_IDS),
         "cache_stats": {
             "videos": len(VIDEO_CACHE),
             "playlists": len(PLAYLIST_CACHE),
@@ -75,42 +71,8 @@ def get_cache_info():
 
 @app.delete("/cache")
 def clear_cache():
-    VIDEO_CACHE.clear()
-    PLAYLIST_CACHE.clear()
-    CHANNEL_CACHE.clear()
-    STREAMS_CACHE.clear()
+    for c in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE, STREAMS_CACHE]: c.clear()
     return {"message": "Caches cleared"}
-
-@app.get("/stream/{video_id}")
-async def get_streams(video_id: str):
-    cleanup_cache()
-    if video_id in VIDEO_CACHE:
-        ts, data, dur = VIDEO_CACHE[video_id]
-        if time.time() - ts < dur: return data
-
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    PROCESSING_IDS.add(video_id)
-    try:
-        def fetch():
-            with YoutubeDL(ydl_opts_base) as ydl:
-                return ydl.extract_info(url, download=False)
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(executor, fetch)
-        
-        formats = [{
-            "itag": f.get("format_id"),
-            "ext": f.get("ext"),
-            "resolution": f.get("resolution"),
-            "url": f.get("url")
-        } for f in info.get("formats", []) if f.get("url") and f.get("ext") != "mhtml"]
-
-        res = {"title": info.get("title"), "id": video_id, "formats": formats}
-        VIDEO_CACHE[video_id] = (time.time(), res, DEFAULT_CACHE_DURATION)
-        return res
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        PROCESSING_IDS.discard(video_id)
 
 @app.get("/channel/streams/{channel_id}")
 async def get_channel_streams(channel_id: str):
@@ -122,101 +84,112 @@ async def get_channel_streams(channel_id: str):
     url = f"https://www.youtube.com/channel/{channel_id}/streams" if channel_id.startswith("UC") else f"https://www.youtube.com/{channel_id}/streams"
 
     try:
-        def fetch():
-            opts = {**ydl_opts_base, "extract_flat": True, "playlist_items": "1-50"}
+        # 1. まず一覧を25件分高速取得
+        def fetch_list():
+            opts = {**ydl_opts_base, "extract_flat": True, "playlist_items": "1-25"}
             with YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
 
         loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(executor, fetch)
-        
+        list_info = await loop.run_in_executor(executor, fetch_list)
+        if not list_info or "entries" not in list_info:
+            return {"channel": channel_id, "streams": []}
+
+        # 2. 25件すべてを並列で詳細解析（視聴者数・正確なステータスを取得）
+        raw_entries = list_info["entries"][:25]
+
+        def fetch_detail(entry):
+            if not entry: return None
+            try:
+                # 各動画のページを個別に叩いて最新情報を取得
+                with YoutubeDL(ydl_opts_base) as ydl:
+                    return ydl.extract_info(f"https://www.youtube.com/watch?v={entry['id']}", download=False)
+            except:
+                return entry
+
+        # 並列実行
+        detail_tasks = [loop.run_in_executor(executor, fetch_detail, e) for e in raw_entries]
+        detailed_results = await asyncio.gather(*detail_tasks)
+
         streams = []
-        for e in info.get("entries", []):
+        for e in detailed_results:
             if not e: continue
-            status = e.get("live_status")
-            is_live = status == "live"
-            is_upcoming = status == "upcoming" or e.get("availability") == "upcoming"
             
+            # ステータスの詳細判定
+            status_raw = e.get("live_status")
+            is_live = status_raw == "live"
+            # yt-dlpのプロパティから予定枠か判定
+            is_upcoming = status_raw == "upcoming" or e.get("availability") == "upcoming" or (not is_live and e.get("release_timestamp"))
+            
+            # 視聴者数(live) or 待機人数(upcoming)
+            viewers = e.get("concurrent_view_count") or e.get("waiting_count") or 0
+
             streams.append({
                 "id": e.get("id"),
                 "title": e.get("title"),
                 "status": "live" if is_live else "upcoming" if is_upcoming else "archived",
-                "viewers": int(e.get("concurrent_view_count") or e.get("waiting_count") or 0),
+                "viewers": int(viewers),
                 "scheduled_start": e.get("release_timestamp") or e.get("timestamp"),
                 "thumbnail": get_best_thumbnail(e.get("thumbnails")),
                 "is_live": is_live,
                 "is_upcoming": is_upcoming
             })
 
-        res = {"channel": info.get("uploader"), "streams": streams}
-        STREAMS_CACHE[channel_id] = (time.time(), res, 300)
+        res = {"channel": list_info.get("uploader") or channel_id, "streams": streams}
+        # 配信情報は頻繁に変わるため、キャッシュは3分(180秒)に設定
+        STREAMS_CACHE[channel_id] = (time.time(), res, 180)
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/stream/{video_id}")
+async def get_streams(video_id: str):
+    cleanup_cache()
+    if video_id in VIDEO_CACHE:
+        ts, data, dur = VIDEO_CACHE[video_id]
+        if time.time() - ts < dur: return data
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        def fetch():
+            with YoutubeDL(ydl_opts_base) as ydl:
+                return ydl.extract_info(url, download=False)
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(executor, fetch)
+        formats = [{"itag": f.get("format_id"), "ext": f.get("ext"), "resolution": f.get("resolution"), "url": f.get("url")} 
+                   for f in info.get("formats", []) if f.get("url") and f.get("ext") != "mhtml"]
+        res = {"title": info.get("title"), "id": video_id, "formats": formats}
+        VIDEO_CACHE[video_id] = (time.time(), res, 600)
         return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/playlist/{playlist_id}")
 async def get_playlist(playlist_id: str):
-    cleanup_cache()
-    if playlist_id in PLAYLIST_CACHE:
-        ts, data, dur = PLAYLIST_CACHE[playlist_id]
-        if time.time() - ts < dur: return data
-
     url = f"https://www.youtube.com/playlist?list={playlist_id}"
     try:
         def fetch():
-            # プレイリストも50件制限で高速取得
-            opts = {**ydl_opts_base, "extract_flat": True, "playlist_items": "1-50"}
+            opts = {**ydl_opts_base, "extract_flat": True, "playlist_items": "1-25"}
             with YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
-        
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
-        
-        entries = [{
-            "id": e.get("id"),
-            "title": e.get("title"),
-            "thumbnail": get_best_thumbnail(e.get("thumbnails")),
-            "duration": e.get("duration"),
-            "uploader": e.get("uploader")
-        } for e in info.get("entries", []) if e]
-
-        res = {
-            "id": playlist_id,
-            "title": info.get("title"),
-            "uploader": info.get("uploader"),
-            "count": len(entries),
-            "entries": entries
-        }
-        PLAYLIST_CACHE[playlist_id] = (time.time(), res, LONG_CACHE_DURATION)
-        return res
+        entries = [{"id": e.get("id"), "title": e.get("title"), "thumbnail": get_best_thumbnail(e.get("thumbnails"))} for e in info.get("entries", []) if e]
+        return {"id": playlist_id, "title": info.get("title"), "entries": entries}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/channel/{channel_id}")
 async def get_channel_videos(channel_id: str):
-    cleanup_cache()
-    if channel_id in CHANNEL_CACHE:
-        ts, data, dur = CHANNEL_CACHE[channel_id]
-        if time.time() - ts < dur: return data
-    
     base_url = f"https://www.youtube.com/channel/{channel_id}" if channel_id.startswith("UC") else f"https://www.youtube.com/{channel_id}"
-    
     try:
         def fetch():
-            opts = {**ydl_opts_base, "extract_flat": True, "playlist_items": "1-50"}
+            opts = {**ydl_opts_base, "extract_flat": True, "playlist_items": "1-25"}
             with YoutubeDL(opts) as ydl:
                 return ydl.extract_info(f"{base_url}/videos", download=False)
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
-        
-        res = {
-            "channel_id": channel_id,
-            "channel_name": info.get("title"),
-            "videos": [{"id": e.get("id"), "title": e.get("title"), "thumbnail": get_best_thumbnail(e.get("thumbnails"))}
-                       for e in info.get("entries", []) if e]
-        }
-        CHANNEL_CACHE[channel_id] = (time.time(), res, CHANNEL_CACHE_DURATION)
-        return res
+        return {"channel_id": channel_id, "videos": [{"id": e.get("id"), "title": e.get("title")} for e in info.get("entries", []) if e]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -225,12 +198,12 @@ async def get_shorts(channel_id: str):
     url = f"https://www.youtube.com/{channel_id}/shorts"
     try:
         def fetch():
-            opts = {**ydl_opts_base, "extract_flat": True, "playlist_items": "1-50"}
+            opts = {**ydl_opts_base, "extract_flat": True, "playlist_items": "1-25"}
             with YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
-        return {"shorts": [{"id": e.get("id"), "title": e.get("title"), "thumbnail": get_best_thumbnail(e.get("thumbnails"))} for e in info.get("entries", []) if e]}
+        return {"shorts": [{"id": e.get("id"), "title": e.get("title")} for e in info.get("entries", []) if e]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
