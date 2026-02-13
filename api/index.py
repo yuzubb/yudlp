@@ -16,18 +16,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 並列処理のワーカー数を維持
+# 25件を同時に処理するためにスレッド数を調整
 executor = ThreadPoolExecutor(max_workers=30)
 
+# 安定性を重視したベースオプション
 ydl_opts_base = {
     "quiet": True,
     "skip_download": True,
     "nocheckcertificate": True,
     "format": "best",
     "proxy": "http://ytproxy-siawaseok.duckdns.org:3007",
-    "ignore_no_formats_error": True,
-    "ignoreerrors": True,
-    "socket_timeout": 7
+    "ignore_no_formats_error": True, # 配信前動画のエラー回避
+    "ignoreerrors": True,           # 1件の失敗で全体を止めない
+    "no_warnings": True,
+    "extract_flat": False,          # 詳細情報を最初から取りに行く
 }
 
 VIDEO_CACHE = {}      
@@ -83,46 +85,40 @@ async def get_channel_streams(channel_id: str):
 
     url = f"https://www.youtube.com/channel/{channel_id}/streams" if channel_id.startswith("UC") else f"https://www.youtube.com/{channel_id}/streams"
 
+    PROCESSING_IDS.add(f"streams_{channel_id}")
     try:
-        # 1. まず一覧を25件分高速取得
-        def fetch_list():
-            opts = {**ydl_opts_base, "extract_flat": True, "playlist_items": "1-25"}
+        def fetch_detailed_list():
+            # playlist_itemsで25個に絞り、詳細抽出モードで実行
+            opts = {
+                **ydl_opts_base,
+                "playlist_items": "1-25",
+            }
             with YoutubeDL(opts) as ydl:
+                # チャンネルの配信一覧を「動画1件ずつ詳細解析しながら」取得
                 return ydl.extract_info(url, download=False)
 
         loop = asyncio.get_event_loop()
-        list_info = await loop.run_in_executor(executor, fetch_list)
-        if not list_info or "entries" not in list_info:
+        info = await loop.run_in_executor(executor, fetch_detailed_list)
+        
+        if not info or "entries" not in info:
             return {"channel": channel_id, "streams": []}
 
-        # 2. 25件すべてを並列で詳細解析（視聴者数・正確なステータスを取得）
-        raw_entries = list_info["entries"][:25]
-
-        def fetch_detail(entry):
-            if not entry: return None
-            try:
-                # 各動画のページを個別に叩いて最新情報を取得
-                with YoutubeDL(ydl_opts_base) as ydl:
-                    return ydl.extract_info(f"https://www.youtube.com/watch?v={entry['id']}", download=False)
-            except:
-                return entry
-
-        # 並列実行
-        detail_tasks = [loop.run_in_executor(executor, fetch_detail, e) for e in raw_entries]
-        detailed_results = await asyncio.gather(*detail_tasks)
-
         streams = []
-        for e in detailed_results:
+        for e in info["entries"]:
             if not e: continue
             
-            # ステータスの詳細判定
-            status_raw = e.get("live_status")
-            is_live = status_raw == "live"
-            # yt-dlpのプロパティから予定枠か判定
-            is_upcoming = status_raw == "upcoming" or e.get("availability") == "upcoming" or (not is_live and e.get("release_timestamp"))
+            # ステータス判定の強化
+            ls = e.get("live_status")
+            is_live = ls == "live"
+            # release_timestampがある、またはステータスがupcomingなら予定
+            is_upcoming = ls == "upcoming" or e.get("availability") == "upcoming" or (not is_live and e.get("release_timestamp") is not None)
             
-            # 視聴者数(live) or 待機人数(upcoming)
-            viewers = e.get("concurrent_view_count") or e.get("waiting_count") or 0
+            # ライブなら同時接続数、予定なら待機人数、それ以外は0
+            viewers = 0
+            if is_live:
+                viewers = e.get("concurrent_view_count") or 0
+            elif is_upcoming:
+                viewers = e.get("waiting_count") or 0
 
             streams.append({
                 "id": e.get("id"),
@@ -135,12 +131,13 @@ async def get_channel_streams(channel_id: str):
                 "is_upcoming": is_upcoming
             })
 
-        res = {"channel": list_info.get("uploader") or channel_id, "streams": streams}
-        # 配信情報は頻繁に変わるため、キャッシュは3分(180秒)に設定
-        STREAMS_CACHE[channel_id] = (time.time(), res, 180)
+        res = {"channel": info.get("uploader") or info.get("title"), "streams": streams}
+        STREAMS_CACHE[channel_id] = (time.time(), res, 120) # 安定性重視のためキャッシュは2分
         return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        PROCESSING_IDS.discard(f"streams_{channel_id}")
 
 @app.get("/stream/{video_id}")
 async def get_streams(video_id: str):
@@ -156,6 +153,8 @@ async def get_streams(video_id: str):
                 return ydl.extract_info(url, download=False)
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
+        if not info: raise Exception("Info fetch failed")
+        
         formats = [{"itag": f.get("format_id"), "ext": f.get("ext"), "resolution": f.get("resolution"), "url": f.get("url")} 
                    for f in info.get("formats", []) if f.get("url") and f.get("ext") != "mhtml"]
         res = {"title": info.get("title"), "id": video_id, "formats": formats}
@@ -169,7 +168,7 @@ async def get_playlist(playlist_id: str):
     url = f"https://www.youtube.com/playlist?list={playlist_id}"
     try:
         def fetch():
-            opts = {**ydl_opts_base, "extract_flat": True, "playlist_items": "1-25"}
+            opts = {**ydl_opts_base, "playlist_items": "1-25"}
             with YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
         loop = asyncio.get_event_loop()
@@ -184,7 +183,7 @@ async def get_channel_videos(channel_id: str):
     base_url = f"https://www.youtube.com/channel/{channel_id}" if channel_id.startswith("UC") else f"https://www.youtube.com/{channel_id}"
     try:
         def fetch():
-            opts = {**ydl_opts_base, "extract_flat": True, "playlist_items": "1-25"}
+            opts = {**ydl_opts_base, "playlist_items": "1-25"}
             with YoutubeDL(opts) as ydl:
                 return ydl.extract_info(f"{base_url}/videos", download=False)
         loop = asyncio.get_event_loop()
@@ -198,7 +197,7 @@ async def get_shorts(channel_id: str):
     url = f"https://www.youtube.com/{channel_id}/shorts"
     try:
         def fetch():
-            opts = {**ydl_opts_base, "extract_flat": True, "playlist_items": "1-25"}
+            opts = {**ydl_opts_base, "playlist_items": "1-25"}
             with YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
         loop = asyncio.get_event_loop()
