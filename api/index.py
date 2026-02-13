@@ -211,27 +211,64 @@ async def get_channel_videos(channel_id: str):
 @app.get("/playlist/{playlist_id}")
 async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
     cleanup_cache()
-    cache_key = f"{playlist_id}_{v}" if v else playlist_id
+    
+    # 取得側(api_get_playlist_mix)からのリクエストに合わせ、
+    # vが含まれる場合はMixリストとしてキャッシュキーを分離
+    cache_key = f"pl_{playlist_id}_{v}" if v else f"pl_{playlist_id}"
+    
     if cache_key in PLAYLIST_CACHE:
         ts, data, dur = PLAYLIST_CACHE[cache_key]
-        if time.time() - ts < dur: return data
+        if time.time() - ts < dur:
+            return data
     
-    url = f"https://www.youtube.com/playlist?list={playlist_id}"
+    # URL構築の最適化
     if playlist_id.startswith("RD"):
+        # Mixリストは動画ID(v)が起点となるため、vがある場合はそちらを優先
         url = f"https://www.youtube.com/watch?v={v}&list={playlist_id}" if v else f"https://www.youtube.com/watch?list={playlist_id}"
+    else:
+        url = f"https://www.youtube.com/playlist?list={playlist_id}"
     
     PROCESSING_IDS.add(playlist_id)
     try:
         def fetch():
-            with YoutubeDL(ydl_opts_flat) as ydl:
+            # playlist_itemsを制限してレスポンス速度を向上
+            opts = {
+                **ydl_opts_flat,
+                "playlist_items": "1-50", 
+            }
+            with YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
+
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
-        entries = [{"id": e.get("id"), "title": e.get("title"), "thumbnail": get_best_thumbnail(e.get("thumbnails"))}
-                   for e in info.get("entries", []) if e]
-        res = {"id": playlist_id, "title": info.get("title"), "entries": entries}
+        
+        if not info:
+            raise Exception("Playlist info not found")
+
+        # 取得側の format_search_item や一般的なYouTube APIの命名規則に寄せる
+        entries = []
+        for e in info.get("entries", []):
+            if not e: continue
+            entries.append({
+                "id": e.get("id"),
+                "videoId": e.get("id"), # 取得側がvideoIdで参照する場合の予備
+                "title": e.get("title"),
+                "author": e.get("uploader") or e.get("channel"),
+                "thumbnail": get_best_thumbnail(e.get("thumbnails")),
+                "lengthSeconds": e.get("duration"),
+                # 取得側がdatetime.timedeltaで計算する場合のために秒数を保持
+            })
+
+        res = {
+            "id": playlist_id,
+            "title": info.get("title"),
+            "uploader": info.get("uploader"),
+            "entries": entries
+        }
+
         PLAYLIST_CACHE[cache_key] = (time.time(), res, LONG_CACHE_DURATION)
         return res
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
