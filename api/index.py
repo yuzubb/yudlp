@@ -207,13 +207,12 @@ async def get_channel_videos(channel_id: str):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         PROCESSING_IDS.discard(channel_id)
-
+        
 @app.get("/playlist/{playlist_id}")
 async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
     cleanup_cache()
     
-    # 取得側(api_get_playlist_mix)からのリクエストに合わせ、
-    # vが含まれる場合はMixリストとしてキャッシュキーを分離
+    # フロントエンドの fetch(`/api/playlist/watch?v=${vId}&list=${plId}`) に合わせたキャッシュキー
     cache_key = f"pl_{playlist_id}_{v}" if v else f"pl_{playlist_id}"
     
     if cache_key in PLAYLIST_CACHE:
@@ -221,9 +220,8 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
         if time.time() - ts < dur:
             return data
     
-    # URL構築の最適化
+    # URL構築
     if playlist_id.startswith("RD"):
-        # Mixリストは動画ID(v)が起点となるため、vがある場合はそちらを優先
         url = f"https://www.youtube.com/watch?v={v}&list={playlist_id}" if v else f"https://www.youtube.com/watch?list={playlist_id}"
     else:
         url = f"https://www.youtube.com/playlist?list={playlist_id}"
@@ -231,10 +229,10 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
     PROCESSING_IDS.add(playlist_id)
     try:
         def fetch():
-            # playlist_itemsを制限してレスポンス速度を向上
+            # playlist_items: 1-50 で取得。HTML側のスクロール表示に十分な量
             opts = {
                 **ydl_opts_flat,
-                "playlist_items": "1-50", 
+                "playlist_items": "1-50",
             }
             with YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
@@ -243,26 +241,22 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
         info = await loop.run_in_executor(executor, fetch)
         
         if not info:
-            raise Exception("Playlist info not found")
+            raise Exception("No playlist info")
 
-        # 取得側の format_search_item や一般的なYouTube APIの命名規則に寄せる
+        # HTML側の e.id, e.thumbnail, e.title に合わせる
         entries = []
         for e in info.get("entries", []):
             if not e: continue
             entries.append({
                 "id": e.get("id"),
-                "videoId": e.get("id"), # 取得側がvideoIdで参照する場合の予備
                 "title": e.get("title"),
-                "author": e.get("uploader") or e.get("channel"),
                 "thumbnail": get_best_thumbnail(e.get("thumbnails")),
-                "lengthSeconds": e.get("duration"),
-                # 取得側がdatetime.timedeltaで計算する場合のために秒数を保持
             })
 
+        # HTML側の plData.title, plData.video_count, plData.entries に合わせる
         res = {
-            "id": playlist_id,
-            "title": info.get("title"),
-            "uploader": info.get("uploader"),
+            "title": info.get("title") or "Playlist",
+            "video_count": info.get("playlist_count") or len(entries),
             "entries": entries
         }
 
