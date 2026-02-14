@@ -36,10 +36,15 @@ ydl_opts_base = {
     "extract_flat": False,
 }
 
-# プレイリスト等の高速取得用（詳細情報を個別に取得しない）
 ydl_opts_flat = {
-    **ydl_opts_base,
-    "extract_flat": True,
+    "quiet": True,
+    "skip_download": True,
+    "nocheckcertificate": True,
+    "extract_flat": "in_playlist",
+    "playlist_items": "1-50",
+    "lazy_playlist": True,
+    "proxy": "http://ytproxy-siawaseok.duckdns.org:3007",
+    "ignore_no_formats_error": True
 }
 
 # 字幕取得用オプション
