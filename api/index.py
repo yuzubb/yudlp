@@ -199,19 +199,65 @@ async def get_streams(video_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/playlist/{playlist_id}")
-async def get_playlist(playlist_id: str):
-    url = f"https://www.youtube.com/playlist?list={playlist_id}"
+async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
+    cleanup_cache()
+    
+    # フロントエンドの fetch(`/api/playlist/watch?v=${vId}&list=${plId}`) に合わせたキャッシュキー
+    cache_key = f"pl_{playlist_id}_{v}" if v else f"pl_{playlist_id}"
+    
+    if cache_key in PLAYLIST_CACHE:
+        ts, data, dur = PLAYLIST_CACHE[cache_key]
+        if time.time() - ts < dur:
+            return data
+    
+    # URL構築
+    if playlist_id.startswith("RD"):
+        url = f"https://www.youtube.com/watch?v={v}&list={playlist_id}" if v else f"https://www.youtube.com/watch?list={playlist_id}"
+    else:
+        url = f"https://www.youtube.com/playlist?list={playlist_id}"
+    
+    PROCESSING_IDS.add(playlist_id)
     try:
         def fetch():
-            opts = {**ydl_opts_base, "playlist_items": "1-25"}
+            # playlist_items: 1-50 で取得。HTML側のスクロール表示に十分な量
+            opts = {
+                **ydl_opts_flat,
+                "playlist_items": "1-50",
+            }
             with YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
+
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
-        entries = [{"id": e.get("id"), "title": e.get("title"), "thumbnail": get_best_thumbnail(e.get("thumbnails"))} for e in info.get("entries", []) if e]
-        return {"id": playlist_id, "title": info.get("title"), "entries": entries}
+        
+        if not info:
+            raise Exception("No playlist info")
+
+        # HTML側の e.id, e.thumbnail, e.title に合わせる
+        entries = []
+        for e in info.get("entries", []):
+            if not e: continue
+            entries.append({
+                "id": e.get("id"),
+                "title": e.get("title"),
+                "thumbnail": get_best_thumbnail(e.get("thumbnails")),
+            })
+
+        # HTML側の plData.title, plData.video_count, plData.entries に合わせる
+        res = {
+            "title": info.get("title") or "Playlist",
+            "video_count": info.get("playlist_count") or len(entries),
+            "entries": entries
+        }
+
+        PLAYLIST_CACHE[cache_key] = (time.time(), res, LONG_CACHE_DURATION)
+        return res
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        PROCESSING_IDS.discard(playlist_id)
+
 
 @app.get("/channel/{channel_id}")
 async def get_channel_videos(channel_id: str):
