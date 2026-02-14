@@ -200,65 +200,97 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
 
 @app.get("/channel/{channel_id}")
 async def get_channel_videos(channel_id: str):
-    # チャンネルの基本URL
-    base_url = f"https://www.youtube.com/channel/{channel_id}" if channel_id.startswith("UC") else f"https://www.youtube.com/{channel_id}"
+    cleanup_cache()
+    if channel_id in CHANNEL_CACHE:
+        ts, data, dur = CHANNEL_CACHE[channel_id]
+        if time.time() - ts < dur: return data
     
+    # URLの組み立て
+    if channel_id.startswith("UC"):
+        base_url = f"https://www.youtube.com/channel/{channel_id}"
+    elif channel_id.startswith("@"):
+        base_url = f"https://www.youtube.com/{channel_id}"
+    else:
+        base_url = f"https://www.youtube.com/channel/{channel_id}"
+        
+    videos_url = f"{base_url}/videos"
+    
+    PROCESSING_IDS.add(channel_id)
     try:
-        def fetch():
-            # チャンネルのトップページ等から情報を取得
-            opts = {**ydl_opts_base, "playlist_items": "1-30"}
-            with YoutubeDL(opts) as ydl:
-                # /videos だけでなく、チャンネル全体のメタデータを取るためにbase_urlで抽出
-                return ydl.extract_info(f"{base_url}/videos", download=False)
-
+        def fetch_data():
+            # 1. チャンネルの基本情報（アイコン、登録者数、名前）を取得
+            with YoutubeDL(ydl_opts_base) as ydl:
+                # process=Trueにしてメタデータをしっかり取得
+                meta = ydl.extract_info(base_url, download=False, process=True)
+            
+            # 2. 動画一覧を取得
+            with YoutubeDL(ydl_opts_flat) as ydl:
+                try:
+                    video_info = ydl.extract_info(videos_url, download=False)
+                except:
+                    # /videosが失敗した場合はトップページから
+                    video_info = ydl.extract_info(base_url, download=False)
+            return meta, video_info
+        
         loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(executor, fetch)
-
-        if not info:
-            raise HTTPException(status_code=404, detail="Channel not found")
-
-        # フロントエンドが期待するJSON構造に整形
-        return {
-            "name": info.get("uploader") or info.get("title"),
-            "icon": info.get("thumbnails")[-1]["url"] if info.get("thumbnails") else None,
-            "subscriber_count": info.get("channel_follower_count"), # yt-dlpが取得可能な場合
+        meta_info, video_info = await loop.run_in_executor(executor, fetch_data)
+        
+        # アイコンURLの取得
+        icon_url = get_best_thumbnail(meta_info.get("thumbnails"))
+        
+        # 登録者数の取得（フロントエンドの formatCount に渡す数値）
+        sub_count = meta_info.get("channel_follower_count") or meta_info.get("subscriber_count")
+        
+        # フロントエンドの変数名に合わせたレスポンス構造
+        res = {
+            "channel_id": meta_info.get("id") or channel_id,
+            "name": meta_info.get("channel") or meta_info.get("uploader") or meta_info.get("title"),
+            "icon": icon_url,          # フロントエンドの img.src 用
+            "avatar": icon_url,        # 予備
+            "description": meta_info.get("description"),
+            "subscriber_count": sub_count,
             "videos": [
                 {
                     "id": e.get("id"),
                     "title": e.get("title"),
-                    "view_count": e.get("view_count"),
-                    "thumbnail": get_best_thumbnail(e.get("thumbnails"))
-                } 
-                for e in info.get("entries", []) if e
+                    "view_count": e.get("view_count"), 
+                    "thumbnail": get_best_thumbnail(e.get("thumbnails")),
+                    "duration": e.get("duration")
+                }
+                for e in video_info.get("entries", []) if e and e.get("id")
             ]
         }
+        
+        CHANNEL_CACHE[channel_id] = (time.time(), res, CHANNEL_CACHE_DURATION)
+        return res
     except Exception as e:
+        print(f"Error fetching channel: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        PROCESSING_IDS.discard(channel_id)
+        
 
 @app.get("/short/{channel_id}")
 async def get_shorts(channel_id: str):
-    url = f"https://www.youtube.com/{channel_id}/shorts"
+    cleanup_cache()
+    if channel_id.startswith("UC"):
+        url = f"https://www.youtube.com/channel/{channel_id}/shorts"
+    elif channel_id.startswith("@"):
+        url = f"https://www.youtube.com/{channel_id}/shorts"
+    else:
+        url = f"https://www.youtube.com/channel/{channel_id}/shorts"
     try:
         def fetch():
-            opts = {**ydl_opts_base, "playlist_items": "1-30"}
-            with YoutubeDL(opts) as ydl:
+            with YoutubeDL(ydl_opts_flat) as ydl:
                 return ydl.extract_info(url, download=False)
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
-        
-        return {
-            "shorts": [
-                {
-                    "id": e.get("id"),
-                    "title": e.get("title"),
-                    "thumbnail": get_best_thumbnail(e.get("thumbnails")),
-                    "view_count": e.get("view_count")
-                } 
-                for e in info.get("entries", []) if e
-            ]
-        }
+        shorts = [{"id": e.get("id"), "title": e.get("title"), "thumbnail": get_best_thumbnail(e.get("thumbnails"))}
+                  for e in info.get("entries", []) if e]
+        return {"channel": channel_id, "shorts": shorts}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.get("/subtitles/{video_id}")
