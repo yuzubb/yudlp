@@ -18,6 +18,7 @@ app.add_middleware(
 
 executor = ThreadPoolExecutor(max_workers=20)
 
+# 基本設定（字幕取得オプションを追加）
 ydl_opts_base = {
     "quiet": True,
     "skip_download": True,
@@ -25,8 +26,11 @@ ydl_opts_base = {
     "format": "best",
     "proxy": "http://ytproxy-siawaseok.duckdns.org:3007",
     "extract_flat": False,
-    "ignore_no_formats_error": True,  # 配信前エラーを無視
-    "ignoreerrors": True              # 一部の動画の取得失敗を飛ばして続行
+    "ignore_no_formats_error": True,
+    "ignoreerrors": True,
+    "writesubtitles": True,              # 手動字幕を取得
+    "writeautomaticsub": True,          # 自動生成字幕を取得
+    "subtitleslangs": ["ja", "en", ".*"], # 日本語、英語を優先し、それ以外も取得可能にする
 }
 
 ydl_opts_flat = {
@@ -85,6 +89,7 @@ async def get_streams(video_id: str):
         info = await loop.run_in_executor(executor, fetch)
         if not info: raise Exception("No info found")
 
+        # 動画フォーマット
         formats = [{
             "itag": f.get("format_id"),
             "ext": f.get("ext"),
@@ -92,7 +97,36 @@ async def get_streams(video_id: str):
             "url": f.get("url")
         } for f in info.get("formats", []) if f.get("url") and f.get("ext") != "mhtml"]
 
-        res = {"title": info.get("title"), "id": video_id, "formats": formats}
+        # --- 字幕データの抽出 ---
+        subtitles = []
+        manual_subs = info.get("subtitles") or {}
+        auto_subs = info.get("automatic_captions") or {}
+        
+        # 全ての字幕ソースをマージ
+        all_langs = set(list(manual_subs.keys()) + list(auto_subs.keys()))
+        
+        for lang in all_langs:
+            # 手動字幕があれば優先、なければ自動生成を使用
+            formats_list = manual_subs.get(lang) or auto_subs.get(lang)
+            if not formats_list: continue
+            
+            # ブラウザで再生しやすい vtt 形式のURLを抽出
+            vtt_url = next((s.get("url") for s in formats_list if s.get("ext") == "vtt"), None)
+            
+            if vtt_url:
+                subtitles.append({
+                    "lang": lang,
+                    "url": vtt_url,
+                    "is_auto": lang in auto_subs and lang not in manual_subs
+                })
+
+        res = {
+            "title": info.get("title"), 
+            "id": video_id, 
+            "formats": formats,
+            "subtitles": subtitles
+        }
+        
         dur = LONG_CACHE_DURATION if len(formats) >= 12 else DEFAULT_CACHE_DURATION
         VIDEO_CACHE[video_id] = (time.time(), res, dur)
         return res
@@ -130,12 +164,9 @@ async def get_channel_streams(channel_id: str):
         
         for e in entries:
             if not e: continue
-            
             status = e.get("live_status")
             is_live = status == "live"
             is_upcoming = status == "upcoming" or e.get("availability") == "upcoming"
-            
-            # 待機人数(waiting_count)または視聴者数(concurrent_view_count)を取得
             viewers = e.get("concurrent_view_count") or e.get("waiting_count") or 0
             
             streams.append({
@@ -155,7 +186,7 @@ async def get_channel_streams(channel_id: str):
             "streams": streams
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch streams: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch: {str(e)}")
 
 @app.get("/channel/{channel_id}")
 async def get_channel_videos(channel_id: str):
@@ -211,16 +242,12 @@ async def get_channel_videos(channel_id: str):
 @app.get("/playlist/{playlist_id}")
 async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
     cleanup_cache()
-    
-    # フロントエンドの fetch(`/api/playlist/watch?v=${vId}&list=${plId}`) に合わせたキャッシュキー
     cache_key = f"pl_{playlist_id}_{v}" if v else f"pl_{playlist_id}"
     
     if cache_key in PLAYLIST_CACHE:
         ts, data, dur = PLAYLIST_CACHE[cache_key]
-        if time.time() - ts < dur:
-            return data
+        if time.time() - ts < dur: return data
     
-    # URL構築
     if playlist_id.startswith("RD"):
         url = f"https://www.youtube.com/watch?v={v}&list={playlist_id}" if v else f"https://www.youtube.com/watch?list={playlist_id}"
     else:
@@ -229,21 +256,15 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
     PROCESSING_IDS.add(playlist_id)
     try:
         def fetch():
-            # playlist_items: 1-50 で取得。HTML側のスクロール表示に十分な量
-            opts = {
-                **ydl_opts_flat,
-                "playlist_items": "1-50",
-            }
+            opts = { **ydl_opts_flat, "playlist_items": "1-50" }
             with YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
 
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
         
-        if not info:
-            raise Exception("No playlist info")
+        if not info: raise Exception("No playlist info")
 
-        # HTML側の e.id, e.thumbnail, e.title に合わせる
         entries = []
         for e in info.get("entries", []):
             if not e: continue
@@ -253,7 +274,6 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
                 "thumbnail": get_best_thumbnail(e.get("thumbnails")),
             })
 
-        # HTML側の plData.title, plData.video_count, plData.entries に合わせる
         res = {
             "title": info.get("title") or "Playlist",
             "video_count": info.get("playlist_count") or len(entries),
@@ -262,7 +282,6 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
 
         PLAYLIST_CACHE[cache_key] = (time.time(), res, LONG_CACHE_DURATION)
         return res
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
