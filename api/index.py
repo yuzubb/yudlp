@@ -305,20 +305,51 @@ async def get_channel_streams(channel_id: str):
         for e in info.get("entries", []):
             if not e: continue
             
-            # 配信中かどうかをチェック
-            is_live = e.get("is_live", False)
+            video_id = e.get("id")
             
-            # 配信中の場合は concurrent_view_count を、そうでない場合は view_count を使用
-            view_count = e.get("concurrent_view_count") if is_live else e.get("view_count")
-            
-            entries.append({
-                "id": e.get("id"),
-                "title": e.get("title"),
-                "thumbnail": get_best_thumbnail(e.get("thumbnails")),
-                "duration": e.get("duration"),
-                "view_count": view_count,
-                "is_live": is_live
-            })
+            # view_countがnullの場合は配信中または配信予定の可能性があるので詳細取得
+            if e.get("view_count") is None and video_id:
+                def fetch_detail():
+                    with YoutubeDL(ydl_opts_base) as ydl:
+                        return ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                
+                try:
+                    detail = await loop.run_in_executor(executor, fetch_detail)
+                    is_live = detail.get("is_live", False)
+                    view_count = detail.get("concurrent_view_count") if is_live else detail.get("view_count", 0)
+                    duration = detail.get("duration")
+                    
+                    entries.append({
+                        "id": video_id,
+                        "title": e.get("title"),
+                        "thumbnail": get_best_thumbnail(e.get("thumbnails")),
+                        "duration": duration,
+                        "view_count": view_count if view_count is not None else 0,
+                        "is_live": is_live
+                    })
+                except:
+                    # 詳細取得失敗時はデフォルト値
+                    entries.append({
+                        "id": video_id,
+                        "title": e.get("title"),
+                        "thumbnail": get_best_thumbnail(e.get("thumbnails")),
+                        "duration": e.get("duration"),
+                        "view_count": 0,
+                        "is_live": False
+                    })
+            else:
+                # view_countがある場合は通常通り
+                is_live = e.get("is_live", False)
+                view_count = e.get("view_count", 0)
+                
+                entries.append({
+                    "id": video_id,
+                    "title": e.get("title"),
+                    "thumbnail": get_best_thumbnail(e.get("thumbnails")),
+                    "duration": e.get("duration"),
+                    "view_count": view_count if view_count is not None else 0,
+                    "is_live": is_live
+                })
         
         return {"channel": channel_id, "streams": entries}
     except Exception as e:
