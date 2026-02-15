@@ -58,6 +58,19 @@ ydl_opts_subs = {
     "subtitleslangs": [".*"],
 }
 
+# ストリーム取得用オプション（配信中の視聴者数を取得）
+ydl_opts_streams = {
+    "quiet": True,
+    "skip_download": True,
+    "nocheckcertificate": True,
+    "extract_flat": "in_playlist",
+    "playlist_items": "1-50",
+    "proxy": "http://ytproxy-siawaseok.duckdns.org:3007",
+    "ignore_no_formats_error": True,
+    "ignoreerrors": True,
+    "no_warnings": True,
+}
+
 # --- キャッシュ & 状態管理 ---
 VIDEO_CACHE = {}      
 PLAYLIST_CACHE = {}
@@ -283,7 +296,7 @@ async def get_channel_streams(channel_id: str):
     
     try:
         def fetch():
-            with YoutubeDL(ydl_opts_flat) as ydl:
+            with YoutubeDL(ydl_opts_streams) as ydl:
                 return ydl.extract_info(url, download=False)
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
@@ -291,12 +304,20 @@ async def get_channel_streams(channel_id: str):
         entries = []
         for e in info.get("entries", []):
             if not e: continue
+            
+            # 配信中かどうかをチェック
+            is_live = e.get("is_live", False)
+            
+            # 配信中の場合は concurrent_view_count を、そうでない場合は view_count を使用
+            view_count = e.get("concurrent_view_count") if is_live else e.get("view_count")
+            
             entries.append({
                 "id": e.get("id"),
                 "title": e.get("title"),
                 "thumbnail": get_best_thumbnail(e.get("thumbnails")),
                 "duration": e.get("duration"),
-                "view_count": e.get("view_count")
+                "view_count": view_count,
+                "is_live": is_live
             })
         
         return {"channel": channel_id, "streams": entries}
