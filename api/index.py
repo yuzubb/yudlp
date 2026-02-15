@@ -18,10 +18,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 25件を同時に処理するためにスレッド数を調整
 executor = ThreadPoolExecutor(max_workers=30)
 
 # --- yt-dlp オプション設定 ---
 
+# 安定性を重視したベースオプション
 ydl_opts_base = {
     "quiet": True,
     "skip_download": True,
@@ -45,18 +47,7 @@ ydl_opts_flat = {
     "ignore_no_formats_error": True
 }
 
-ydl_opts_channel = {
-    "quiet": True,
-    "skip_download": True,
-    "nocheckcertificate": True,
-    "extract_flat": "in_playlist",
-    "playlist_items": "1-50",
-    "proxy": "http://ytproxy-siawaseok.duckdns.org:3007",
-    "ignore_no_formats_error": True,
-    "ignoreerrors": True,
-    "no_warnings": True,
-}
-
+# 字幕取得用オプション
 ydl_opts_subs = {
     "quiet": True,
     "skip_download": True,
@@ -72,7 +63,6 @@ VIDEO_CACHE = {}
 PLAYLIST_CACHE = {}
 CHANNEL_CACHE = {}
 STREAMS_CACHE = {}
-CHANNEL_STREAMS_CACHE = {}
 SUBTITLE_LIST_CACHE = {} 
 SUBTITLE_CONTENT_CACHE = {} 
 PROCESSING_IDS = set()
@@ -84,14 +74,13 @@ CHANNEL_CACHE_DURATION = 7200
 
 def cleanup_cache():
     now = time.time()
-    for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE, STREAMS_CACHE, CHANNEL_STREAMS_CACHE]:
+    for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE, STREAMS_CACHE]:
         expired = [k for k, (ts, _, dur) in cache.items() if now - ts >= dur]
         for k in expired:
             del cache[k]
 
 def get_best_thumbnail(thumbnails):
-    if not thumbnails:
-        return None
+    if not thumbnails: return None
     return thumbnails[-1].get("url")
 
 def parse_vtt(vtt_text: str):
@@ -104,18 +93,15 @@ def parse_vtt(vtt_text: str):
     for line in lines:
         match = time_pattern.match(line)
         if match:
-            if current_entry:
-                results.append(current_entry)
+            if current_entry: results.append(current_entry)
             current_entry = {"start": match.group(1), "end": match.group(2), "text": ""}
         elif current_entry and line.strip() and not any(s in line for s in ['WEBVTT', 'Kind:', 'Language:']):
             clean_text = re.sub(r'<[^>]+>', '', line).strip()
             if clean_text:
                 current_entry["text"] += clean_text + " "
                 
-    if current_entry:
-        results.append(current_entry)
-    for item in results:
-        item["text"] = item["text"].strip()
+    if current_entry: results.append(current_entry)
+    for item in results: item["text"] = item["text"].strip()
     return [r for r in results if r["text"]]
 
 # --- API ルート ---
@@ -129,8 +115,7 @@ def get_status():
             "videos": len(VIDEO_CACHE),
             "playlists": len(PLAYLIST_CACHE),
             "channels": len(CHANNEL_CACHE),
-            "streams": len(STREAMS_CACHE),
-            "channel_streams": len(CHANNEL_STREAMS_CACHE)
+            "streams": len(STREAMS_CACHE)
         }
     }
 
@@ -140,14 +125,12 @@ def get_cache_info():
         "video": list(VIDEO_CACHE.keys()),
         "playlist": list(PLAYLIST_CACHE.keys()),
         "channel": list(CHANNEL_CACHE.keys()),
-        "streams": list(STREAMS_CACHE.keys()),
-        "channel_streams": list(CHANNEL_STREAMS_CACHE.keys())
+        "streams": list(STREAMS_CACHE.keys())
     }
 
 @app.delete("/cache")
 def clear_cache():
-    for c in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE, STREAMS_CACHE, CHANNEL_STREAMS_CACHE]:
-        c.clear()
+    for c in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE, STREAMS_CACHE]: c.clear()
     return {"message": "Caches cleared"}
 
 @app.get("/stream/{video_id}")
@@ -155,8 +138,7 @@ async def get_streams(video_id: str):
     cleanup_cache()
     if video_id in VIDEO_CACHE:
         ts, data, dur = VIDEO_CACHE[video_id]
-        if time.time() - ts < dur:
-            return data
+        if time.time() - ts < dur: return data
 
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
@@ -165,24 +147,11 @@ async def get_streams(video_id: str):
                 return ydl.extract_info(url, download=False)
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
-        if not info:
-            raise Exception("Info fetch failed")
+        if not info: raise Exception("Info fetch failed")
         
-        formats = [
-            {
-                "itag": f.get("format_id"),
-                "ext": f.get("ext"),
-                "resolution": f.get("resolution"),
-                "url": f.get("url")
-            }
-            for f in info.get("formats", [])
-            if f.get("url") and f.get("ext") != "mhtml"
-        ]
-        res = {
-            "title": info.get("title"),
-            "id": video_id,
-            "formats": formats
-        }
+        formats = [{"itag": f.get("format_id"), "ext": f.get("ext"), "resolution": f.get("resolution"), "url": f.get("url")} 
+                   for f in info.get("formats", []) if f.get("url") and f.get("ext") != "mhtml"]
+        res = {"title": info.get("title"), "id": video_id, "formats": formats}
         VIDEO_CACHE[video_id] = (time.time(), res, 600)
         return res
     except Exception as e:
@@ -195,8 +164,7 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
     
     if cache_key in PLAYLIST_CACHE:
         ts, data, dur = PLAYLIST_CACHE[cache_key]
-        if time.time() - ts < dur:
-            return data
+        if time.time() - ts < dur: return data
     
     if playlist_id.startswith("RD"):
         url = f"https://www.youtube.com/watch?v={v}&list={playlist_id}" if v else f"https://www.youtube.com/watch?list={playlist_id}"
@@ -213,13 +181,11 @@ async def get_playlist(playlist_id: str, v: Optional[str] = Query(None)):
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
         
-        if not info:
-            raise Exception("No playlist info")
+        if not info: raise Exception("No playlist info")
 
         entries = []
         for e in info.get("entries", []):
-            if not e:
-                continue
+            if not e: continue
             entries.append({
                 "id": e.get("id"),
                 "title": e.get("title"),
@@ -243,70 +209,66 @@ async def get_channel_videos(channel_id: str):
     cleanup_cache()
     if channel_id in CHANNEL_CACHE:
         ts, data, dur = CHANNEL_CACHE[channel_id]
-        if time.time() - ts < dur:
-            return data
+        if time.time() - ts < dur: return data
     
+    # URLの組み立て
     if channel_id.startswith("UC"):
-        videos_url = f"https://www.youtube.com/channel/{channel_id}/videos"
+        base_url = f"https://www.youtube.com/channel/{channel_id}"
     elif channel_id.startswith("@"):
-        videos_url = f"https://www.youtube.com/{channel_id}/videos"
+        base_url = f"https://www.youtube.com/{channel_id}"
     else:
-        videos_url = f"https://www.youtube.com/channel/{channel_id}/videos"
+        base_url = f"https://www.youtube.com/channel/{channel_id}"
+        
+    videos_url = f"{base_url}/videos"
     
     PROCESSING_IDS.add(channel_id)
     try:
         def fetch_data():
-            with YoutubeDL(ydl_opts_channel) as ydl:
-                return ydl.extract_info(videos_url, download=False)
+            # 1. チャンネルの基本情報（アイコン、登録者数、名前）を取得
+            with YoutubeDL(ydl_opts_base) as ydl:
+                # process=Trueにしてメタデータをしっかり取得
+                meta = ydl.extract_info(base_url, download=False, process=True)
+            
+            # 2. 動画一覧を取得
+            with YoutubeDL(ydl_opts_flat) as ydl:
+                try:
+                    video_info = ydl.extract_info(videos_url, download=False)
+                except:
+                    # /videosが失敗した場合はトップページから
+                    video_info = ydl.extract_info(base_url, download=False)
+            return meta, video_info
         
         loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(executor, fetch_data)
+        meta_info, video_info = await loop.run_in_executor(executor, fetch_data)
         
-        if not info:
-            raise HTTPException(status_code=404, detail="Channel not found")
+        # アイコンURLの取得
+        icon_url = get_best_thumbnail(meta_info.get("thumbnails"))
         
-        icon_url = get_best_thumbnail(info.get("thumbnails"))
+        # 登録者数の取得（フロントエンドの formatCount に渡す数値）
+        sub_count = meta_info.get("channel_follower_count") or meta_info.get("subscriber_count")
         
-        sub_count = (
-            info.get("channel_follower_count") or 
-            info.get("subscriber_count") or 
-            0
-        )
-        
-        channel_name = (
-            info.get("channel") or 
-            info.get("uploader") or 
-            info.get("title") or 
-            channel_id
-        )
-        
-        videos = []
-        for e in info.get("entries", []):
-            if not e or not e.get("id"):
-                continue
-            videos.append({
-                "id": e.get("id"),
-                "title": e.get("title"),
-                "view_count": e.get("view_count"), 
-                "thumbnail": get_best_thumbnail(e.get("thumbnails")),
-                "duration": e.get("duration")
-            })
-        
+        # フロントエンドの変数名に合わせたレスポンス構造
         res = {
-            "channel_id": info.get("channel_id") or info.get("id") or channel_id,
-            "name": channel_name,
-            "icon": icon_url,
-            "avatar": icon_url,
-            "description": info.get("description"),
+            "channel_id": meta_info.get("id") or channel_id,
+            "name": meta_info.get("channel") or meta_info.get("uploader") or meta_info.get("title"),
+            "icon": icon_url,          # フロントエンドの img.src 用
+            "avatar": icon_url,        # 予備
+            "description": meta_info.get("description"),
             "subscriber_count": sub_count,
-            "videos": videos
+            "videos": [
+                {
+                    "id": e.get("id"),
+                    "title": e.get("title"),
+                    "view_count": e.get("view_count"), 
+                    "thumbnail": get_best_thumbnail(e.get("thumbnails")),
+                    "duration": e.get("duration")
+                }
+                for e in video_info.get("entries", []) if e and e.get("id")
+            ]
         }
         
         CHANNEL_CACHE[channel_id] = (time.time(), res, CHANNEL_CACHE_DURATION)
         return res
-        
-    except HTTPException:
-        raise
     except Exception as e:
         print(f"Error fetching channel: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -315,65 +277,35 @@ async def get_channel_videos(channel_id: str):
 
 @app.get("/channel/stream/{channel_id}")
 async def get_channel_streams(channel_id: str):
-    """チャンネルのストリーム（配信）一覧を取得"""
     cleanup_cache()
-    
-    cache_key = f"stream_{channel_id}"
-    if cache_key in CHANNEL_STREAMS_CACHE:
-        ts, data, dur = CHANNEL_STREAMS_CACHE[cache_key]
-        if time.time() - ts < dur: 
-            return data
-    
     if channel_id.startswith("UC"):
-        streams_url = f"https://www.youtube.com/channel/{channel_id}/streams"
+        url = f"https://www.youtube.com/channel/{channel_id}/streams"
     elif channel_id.startswith("@"):
-        streams_url = f"https://www.youtube.com/{channel_id}/streams"
+        url = f"https://www.youtube.com/{channel_id}/streams"
     else:
-        streams_url = f"https://www.youtube.com/channel/{channel_id}/streams"
+        url = f"https://www.youtube.com/channel/{channel_id}/streams"
     
-    PROCESSING_IDS.add(cache_key)
     try:
-        def fetch_data():
-            with YoutubeDL(ydl_opts_channel) as ydl:
-                return ydl.extract_info(streams_url, download=False)
-        
+        def fetch():
+            with YoutubeDL(ydl_opts_flat) as ydl:
+                return ydl.extract_info(url, download=False)
         loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(executor, fetch_data)
+        info = await loop.run_in_executor(executor, fetch)
         
-        if not info:
-            raise HTTPException(status_code=404, detail="Channel streams not found")
-        
-        streams = []
+        entries = []
         for e in info.get("entries", []):
-            if not e or not e.get("id"):
-                continue
-            streams.append({
+            if not e: continue
+            entries.append({
                 "id": e.get("id"),
                 "title": e.get("title"),
                 "thumbnail": get_best_thumbnail(e.get("thumbnails")),
                 "duration": e.get("duration"),
-                "view_count": e.get("view_count"),
-                "is_live": e.get("is_live", False),
-                "live_status": e.get("live_status")
+                "view_count": e.get("view_count")
             })
         
-        res = {
-            "channel_id": info.get("channel_id") or info.get("id") or channel_id,
-            "channel_name": info.get("channel") or info.get("uploader") or info.get("title"),
-            "streams": streams,
-            "total_count": len(streams)
-        }
-        
-        CHANNEL_STREAMS_CACHE[cache_key] = (time.time(), res, 1800)
-        return res
-        
-    except HTTPException:
-        raise
+        return {"channel": channel_id, "streams": entries}
     except Exception as e:
-        print(f"Error fetching channel streams: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        PROCESSING_IDS.discard(cache_key)
 
 @app.get("/short/{channel_id}")
 async def get_shorts(channel_id: str):
@@ -390,19 +322,9 @@ async def get_shorts(channel_id: str):
                 return ydl.extract_info(url, download=False)
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
-        shorts = [
-            {
-                "id": e.get("id"),
-                "title": e.get("title"),
-                "thumbnail": get_best_thumbnail(e.get("thumbnails"))
-            }
-            for e in info.get("entries", [])
-            if e
-        ]
-        return {
-            "channel": channel_id,
-            "shorts": shorts
-        }
+        shorts = [{"id": e.get("id"), "title": e.get("title"), "thumbnail": get_best_thumbnail(e.get("thumbnails"))}
+                  for e in info.get("entries", []) if e]
+        return {"channel": channel_id, "shorts": shorts}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -411,8 +333,7 @@ async def get_subtitle_list(video_id: str):
     cleanup_cache()
     if video_id in SUBTITLE_LIST_CACHE:
         ts, data, dur = SUBTITLE_LIST_CACHE[video_id]
-        if time.time() - ts < dur:
-            return data
+        if time.time() - ts < dur: return data
 
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
@@ -436,11 +357,7 @@ async def get_subtitle_list(video_id: str):
                     "is_auto": lang in auto and lang not in manual
                 })
 
-        res = {
-            "video_id": video_id,
-            "total_languages": len(available_languages),
-            "languages": available_languages
-        }
+        res = {"video_id": video_id, "total_languages": len(available_languages), "languages": available_languages}
         SUBTITLE_LIST_CACHE[video_id] = (time.time(), res, LONG_CACHE_DURATION)
         return res
     except Exception as e:
@@ -452,8 +369,7 @@ async def get_subtitle_content(video_id: str, lang: str = "ja"):
     cache_key = f"{video_id}_{lang}"
     if cache_key in SUBTITLE_CONTENT_CACHE:
         ts, data, dur = SUBTITLE_CONTENT_CACHE[cache_key]
-        if time.time() - ts < dur:
-            return data
+        if time.time() - ts < dur: return data
 
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
@@ -464,18 +380,13 @@ async def get_subtitle_content(video_id: str, lang: str = "ja"):
         info = await loop.run_in_executor(executor, fetch)
         
         formats = (info.get("subtitles") or {}).get(lang) or (info.get("automatic_captions") or {}).get(lang)
-        if not formats:
-            raise HTTPException(status_code=404, detail="Language not found")
+        if not formats: raise HTTPException(status_code=404, detail="Language not found")
         
         target_url = next((s["url"] for s in formats if s["ext"] == "vtt"), None)
         async with httpx.AsyncClient() as client:
             resp = await client.get(target_url)
             parsed_data = parse_vtt(resp.text)
-            res = {
-                "video_id": video_id,
-                "lang": lang,
-                "segments": parsed_data
-            }
+            res = {"video_id": video_id, "lang": lang, "segments": parsed_data}
             SUBTITLE_CONTENT_CACHE[cache_key] = (time.time(), res, LONG_CACHE_DURATION)
             return res
     except Exception as e:
