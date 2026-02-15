@@ -18,12 +18,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 25件を同時に処理するためにスレッド数を調整
 executor = ThreadPoolExecutor(max_workers=30)
 
 # --- yt-dlp オプション設定 ---
 
-# 安定性を重視したベースオプション
 ydl_opts_base = {
     "quiet": True,
     "skip_download": True,
@@ -47,7 +45,19 @@ ydl_opts_flat = {
     "ignore_no_formats_error": True
 }
 
-# 字幕取得用オプション
+# チャンネル動画取得用オプション（高速化）
+ydl_opts_channel = {
+    "quiet": True,
+    "skip_download": True,
+    "nocheckcertificate": True,
+    "extract_flat": "in_playlist",
+    "playlist_items": "1-50",
+    "proxy": "http://ytproxy-siawaseok.duckdns.org:3007",
+    "ignore_no_formats_error": True,
+    "ignoreerrors": True,
+    "no_warnings": True,
+}
+
 ydl_opts_subs = {
     "quiet": True,
     "skip_download": True,
@@ -68,6 +78,7 @@ SUBTITLE_CONTENT_CACHE = {}
 PROCESSING_IDS = set()
 
 LONG_CACHE_DURATION = 14200
+CHANNEL_CACHE_DURATION = 7200  # チャンネル情報は2時間キャッシュ
 
 # --- ユーティリティ ---
 
@@ -212,68 +223,76 @@ async def get_channel_videos(channel_id: str):
     
     # URLの組み立て
     if channel_id.startswith("UC"):
-        base_url = f"https://www.youtube.com/channel/{channel_id}"
+        videos_url = f"https://www.youtube.com/channel/{channel_id}/videos"
     elif channel_id.startswith("@"):
-        base_url = f"https://www.youtube.com/{channel_id}"
+        videos_url = f"https://www.youtube.com/{channel_id}/videos"
     else:
-        base_url = f"https://www.youtube.com/channel/{channel_id}"
-        
-    videos_url = f"{base_url}/videos"
+        videos_url = f"https://www.youtube.com/channel/{channel_id}/videos"
     
     PROCESSING_IDS.add(channel_id)
     try:
         def fetch_data():
-            # 1. チャンネルの基本情報（アイコン、登録者数、名前）を取得
-            with YoutubeDL(ydl_opts_base) as ydl:
-                # process=Trueにしてメタデータをしっかり取得
-                meta = ydl.extract_info(base_url, download=False, process=True)
-            
-            # 2. 動画一覧を取得
-            with YoutubeDL(ydl_opts_flat) as ydl:
-                try:
-                    video_info = ydl.extract_info(videos_url, download=False)
-                except:
-                    # /videosが失敗した場合はトップページから
-                    video_info = ydl.extract_info(base_url, download=False)
-            return meta, video_info
+            # 1回の呼び出しで全情報を取得（高速化）
+            with YoutubeDL(ydl_opts_channel) as ydl:
+                return ydl.extract_info(videos_url, download=False)
         
         loop = asyncio.get_event_loop()
-        meta_info, video_info = await loop.run_in_executor(executor, fetch_data)
+        info = await loop.run_in_executor(executor, fetch_data)
         
-        # アイコンURLの取得
-        icon_url = get_best_thumbnail(meta_info.get("thumbnails"))
+        if not info:
+            raise HTTPException(status_code=404, detail="Channel not found")
         
-        # 登録者数の取得（フロントエンドの formatCount に渡す数値）
-        sub_count = meta_info.get("channel_follower_count") or meta_info.get("subscriber_count")
+        # アイコンURLの取得（チャンネル情報から）
+        icon_url = get_best_thumbnail(info.get("thumbnails"))
         
-        # フロントエンドの変数名に合わせたレスポンス構造
+        # 登録者数の取得
+        sub_count = (
+            info.get("channel_follower_count") or 
+            info.get("subscriber_count") or 
+            0
+        )
+        
+        # チャンネル名の取得
+        channel_name = (
+            info.get("channel") or 
+            info.get("uploader") or 
+            info.get("title") or 
+            channel_id
+        )
+        
+        # 動画リストの構築
+        videos = []
+        for e in info.get("entries", []):
+            if not e or not e.get("id"):
+                continue
+            videos.append({
+                "id": e.get("id"),
+                "title": e.get("title"),
+                "view_count": e.get("view_count"), 
+                "thumbnail": get_best_thumbnail(e.get("thumbnails")),
+                "duration": e.get("duration")
+            })
+        
         res = {
-            "channel_id": meta_info.get("id") or channel_id,
-            "name": meta_info.get("channel") or meta_info.get("uploader") or meta_info.get("title"),
-            "icon": icon_url,          # フロントエンドの img.src 用
-            "avatar": icon_url,        # 予備
-            "description": meta_info.get("description"),
+            "channel_id": info.get("channel_id") or info.get("id") or channel_id,
+            "name": channel_name,
+            "icon": icon_url,
+            "avatar": icon_url,
+            "description": info.get("description"),
             "subscriber_count": sub_count,
-            "videos": [
-                {
-                    "id": e.get("id"),
-                    "title": e.get("title"),
-                    "view_count": e.get("view_count"), 
-                    "thumbnail": get_best_thumbnail(e.get("thumbnails")),
-                    "duration": e.get("duration")
-                }
-                for e in video_info.get("entries", []) if e and e.get("id")
-            ]
+            "videos": videos
         }
         
         CHANNEL_CACHE[channel_id] = (time.time(), res, CHANNEL_CACHE_DURATION)
         return res
+        
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error fetching channel: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         PROCESSING_IDS.discard(channel_id)
-        
 
 @app.get("/short/{channel_id}")
 async def get_shorts(channel_id: str):
@@ -295,8 +314,6 @@ async def get_shorts(channel_id: str):
         return {"channel": channel_id, "shorts": shorts}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
 
 @app.get("/subtitles/{video_id}")
 async def get_subtitle_list(video_id: str):
