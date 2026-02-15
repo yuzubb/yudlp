@@ -318,8 +318,16 @@ async def get_shorts(channel_id: str):
                 return ydl.extract_info(url, download=False)
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
-        shorts = [{"id": e.get("id"), "title": e.get("title"), "thumbnail": get_best_thumbnail(e.get("thumbnails"))}
-                  for e in info.get("entries", []) if e]
+        shorts = [
+            {
+                "id": e.get("id"),
+                "title": e.get("title"),
+                "thumbnail": get_best_thumbnail(e.get("thumbnails")),
+                "view_count": e.get("view_count"),
+                "duration": e.get("duration")
+            }
+            for e in info.get("entries", []) if e
+        ]
         return {"channel": channel_id, "shorts": shorts}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
