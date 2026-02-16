@@ -76,6 +76,8 @@ VIDEO_CACHE = {}
 PLAYLIST_CACHE = {}
 CHANNEL_CACHE = {}
 STREAMS_CACHE = {}
+CHANNEL_STREAMS_CACHE = {}
+CHANNEL_FEATURED_CACHE = {}
 SUBTITLE_LIST_CACHE = {} 
 SUBTITLE_CONTENT_CACHE = {} 
 PROCESSING_IDS = set()
@@ -87,7 +89,7 @@ CHANNEL_CACHE_DURATION = 7200
 
 def cleanup_cache():
     now = time.time()
-    for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE, STREAMS_CACHE]:
+    for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE, STREAMS_CACHE, CHANNEL_STREAMS_CACHE, CHANNEL_FEATURED_CACHE]:
         expired = [k for k, (ts, _, dur) in cache.items() if now - ts >= dur]
         for k in expired:
             del cache[k]
@@ -128,7 +130,9 @@ def get_status():
             "videos": len(VIDEO_CACHE),
             "playlists": len(PLAYLIST_CACHE),
             "channels": len(CHANNEL_CACHE),
-            "streams": len(STREAMS_CACHE)
+            "streams": len(STREAMS_CACHE),
+            "channel_streams": len(CHANNEL_STREAMS_CACHE),
+            "channel_featured": len(CHANNEL_FEATURED_CACHE)
         }
     }
 
@@ -138,12 +142,15 @@ def get_cache_info():
         "video": list(VIDEO_CACHE.keys()),
         "playlist": list(PLAYLIST_CACHE.keys()),
         "channel": list(CHANNEL_CACHE.keys()),
-        "streams": list(STREAMS_CACHE.keys())
+        "streams": list(STREAMS_CACHE.keys()),
+        "channel_streams": list(CHANNEL_STREAMS_CACHE.keys()),
+        "channel_featured": list(CHANNEL_FEATURED_CACHE.keys())
     }
 
 @app.delete("/cache")
 def clear_cache():
-    for c in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE, STREAMS_CACHE]: c.clear()
+    for c in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE, STREAMS_CACHE, CHANNEL_STREAMS_CACHE, CHANNEL_FEATURED_CACHE]:
+        c.clear()
     return {"message": "Caches cleared"}
 
 @app.get("/stream/{video_id}")
@@ -284,6 +291,81 @@ async def get_channel_videos(channel_id: str):
     finally:
         PROCESSING_IDS.discard(channel_id)
 
+@app.get("/channel/feature/{channel_id}")
+async def get_channel_featured(channel_id: str):
+    """チャンネルのfeaturedページから情報を取得"""
+    cleanup_cache()
+    
+    # @付きIDに変換
+    if not channel_id.startswith("@") and not channel_id.startswith("UC"):
+        channel_id = f"@{channel_id}"
+    
+    cache_key = f"feat_{channel_id}"
+    if cache_key in CHANNEL_CACHE:
+        ts, data, dur = CHANNEL_CACHE[cache_key]
+        if time.time() - ts < dur:
+            return data
+    
+    # URLの組み立て
+    if channel_id.startswith("UC"):
+        featured_url = f"https://www.youtube.com/channel/{channel_id}/featured"
+    elif channel_id.startswith("@"):
+        featured_url = f"https://www.youtube.com/{channel_id}/featured"
+    else:
+        featured_url = f"https://www.youtube.com/channel/{channel_id}/featured"
+    
+    PROCESSING_IDS.add(cache_key)
+    try:
+        def fetch_data():
+            with YoutubeDL(ydl_opts_flat) as ydl:
+                return ydl.extract_info(featured_url, download=False)
+        
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(executor, fetch_data)
+        
+        if not info:
+            raise HTTPException(status_code=404, detail="Channel featured page not found")
+        
+        # チャンネル基本情報
+        icon_url = get_best_thumbnail(info.get("thumbnails"))
+        sub_count = info.get("channel_follower_count") or info.get("subscriber_count")
+        channel_name = info.get("channel") or info.get("uploader") or info.get("title")
+        
+        # featuredページの動画を取得
+        featured_videos = []
+        for e in info.get("entries", [])[:12]:  # 最大12件
+            if not e or not e.get("id"):
+                continue
+            featured_videos.append({
+                "id": e.get("id"),
+                "title": e.get("title"),
+                "view_count": e.get("view_count"),
+                "thumbnail": get_best_thumbnail(e.get("thumbnails")),
+                "duration": e.get("duration"),
+                "published": e.get("upload_date")
+            })
+        
+        res = {
+            "channel_id": info.get("channel_id") or info.get("id") or channel_id,
+            "name": channel_name,
+            "icon": icon_url,
+            "description": info.get("description"),
+            "subscriber_count": sub_count,
+            "featured_videos": featured_videos,
+            "video_count": len(featured_videos)
+        }
+        
+        CHANNEL_CACHE[cache_key] = (time.time(), res, CHANNEL_CACHE_DURATION)
+        return res
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching featured page: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        PROCESSING_IDS.discard(cache_key)
+
 @app.get("/channel/stream/{channel_id}")
 async def get_channel_streams(channel_id: str):
     cleanup_cache()
@@ -300,6 +382,9 @@ async def get_channel_streams(channel_id: str):
                 return ydl.extract_info(url, download=False)
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(executor, fetch)
+        
+        if not info:
+            return {"channel": channel_id, "streams": []}
         
         entries = []
         for e in info.get("entries", []):
@@ -327,7 +412,8 @@ async def get_channel_streams(channel_id: str):
                         "view_count": view_count if view_count is not None else 0,
                         "is_live": is_live
                     })
-                except:
+                except Exception as detail_error:
+                    print(f"Detail fetch error for {video_id}: {detail_error}")
                     # 詳細取得失敗時はデフォルト値
                     entries.append({
                         "id": video_id,
@@ -353,7 +439,107 @@ async def get_channel_streams(channel_id: str):
         
         return {"channel": channel_id, "streams": entries}
     except Exception as e:
+        print(f"Stream fetch error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/channel/feature/{channel_id}")
+async def get_channel_featured(channel_id: str):
+    """チャンネルのfeaturedページから情報を取得"""
+    cleanup_cache()
+    
+    # キャッシュチェック
+    if channel_id in CHANNEL_FEATURED_CACHE:
+        ts, data, dur = CHANNEL_FEATURED_CACHE[channel_id]
+        if time.time() - ts < dur:
+            return data
+    
+    # @から始まるIDに変換（UCから始まる場合はInvidiousで変換が必要）
+    handle = None
+    if channel_id.startswith("UC"):
+        # UCIDの場合は一度チャンネル情報を取得してハンドルを取得
+        try:
+            def get_handle():
+                with YoutubeDL(ydl_opts_base) as ydl:
+                    info = ydl.extract_info(f"https://www.youtube.com/channel/{channel_id}", download=False)
+                    # uploader_url から @handle を抽出
+                    uploader_url = info.get("uploader_url", "")
+                    if "/@" in uploader_url:
+                        return uploader_url.split("/@")[1].split("/")[0]
+                    return None
+            
+            loop = asyncio.get_event_loop()
+            handle = await loop.run_in_executor(executor, get_handle)
+        except Exception as e:
+            print(f"Failed to get handle for {channel_id}: {e}")
+        
+        # ハンドルが取得できた場合は@を使用、できない場合はUCIDを使用
+        if handle:
+            url = f"https://www.youtube.com/@{handle}/featured"
+        else:
+            url = f"https://www.youtube.com/channel/{channel_id}/featured"
+    elif channel_id.startswith("@"):
+        handle = channel_id[1:]  # @を除去
+        url = f"https://www.youtube.com/{channel_id}/featured"
+    else:
+        url = f"https://www.youtube.com/channel/{channel_id}/featured"
+    
+    PROCESSING_IDS.add(f"featured_{channel_id}")
+    try:
+        def fetch_data():
+            # featuredページの情報を取得
+            with YoutubeDL(ydl_opts_flat) as ydl:
+                return ydl.extract_info(url, download=False)
+        
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(executor, fetch_data)
+        
+        if not info:
+            raise HTTPException(status_code=404, detail="Featured page not found")
+        
+        # @handleを取得（なければuploader_urlから取得を試みる）
+        if not handle:
+            uploader_url = info.get("uploader_url", "")
+            if "/@" in uploader_url:
+                handle = uploader_url.split("/@")[1].split("/")[0]
+        
+        # チャンネル基本情報
+        channel_data = {
+            "channel_id": info.get("channel_id") or info.get("id") or channel_id,
+            "handle": f"@{handle}" if handle else None,
+            "name": info.get("channel") or info.get("uploader") or info.get("title"),
+            "icon": get_best_thumbnail(info.get("thumbnails")),
+            "subscriber_count": info.get("channel_follower_count") or info.get("subscriber_count"),
+            "description": info.get("description"),
+        }
+        
+        # 注目動画・人気動画を取得
+        featured_videos = []
+        for e in info.get("entries", [])[:12]:  # 最大12件
+            if not e or not e.get("id"):
+                continue
+            featured_videos.append({
+                "id": e.get("id"),
+                "title": e.get("title"),
+                "thumbnail": get_best_thumbnail(e.get("thumbnails")),
+                "duration": e.get("duration"),
+                "view_count": e.get("view_count")
+            })
+        
+        channel_data["featured_videos"] = featured_videos
+        channel_data["video_count"] = len(featured_videos)
+        
+        # キャッシュに保存（1時間）
+        CHANNEL_FEATURED_CACHE[channel_id] = (time.time(), channel_data, 3600)
+        
+        return channel_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching featured page: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        PROCESSING_IDS.discard(f"featured_{channel_id}")
 
 @app.get("/short/{channel_id}")
 async def get_shorts(channel_id: str):
