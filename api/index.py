@@ -486,8 +486,13 @@ async def get_channel_featured(channel_id: str):
     PROCESSING_IDS.add(f"featured_{channel_id}")
     try:
         def fetch_data():
-            # featuredページの情報を取得
-            with YoutubeDL(ydl_opts_flat) as ydl:
+            # featuredページはflatモードだと動画リストが取れないためbaseで取得
+            opts = {
+                **ydl_opts_base,
+                "extract_flat": "in_playlist",
+                "playlist_items": "1-12",
+            }
+            with YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
         
         loop = asyncio.get_event_loop()
@@ -514,7 +519,7 @@ async def get_channel_featured(channel_id: str):
         
         # 注目動画・人気動画を取得
         featured_videos = []
-        for e in info.get("entries", [])[:12]:  # 最大12件
+        for e in info.get("entries", [])[:12]:
             if not e or not e.get("id"):
                 continue
             featured_videos.append({
@@ -524,6 +529,38 @@ async def get_channel_featured(channel_id: str):
                 "duration": e.get("duration"),
                 "view_count": e.get("view_count")
             })
+        
+        # featuredが空の場合は/videosの最新12件にフォールバック
+        if not featured_videos:
+            print(f"Featured empty, fallback to /videos for {channel_id}")
+            def fetch_videos():
+                if handle:
+                    videos_url = f"https://www.youtube.com/@{handle}/videos"
+                elif channel_id.startswith("UC"):
+                    videos_url = f"https://www.youtube.com/channel/{channel_id}/videos"
+                else:
+                    videos_url = f"https://www.youtube.com/{channel_id}/videos"
+                opts = {
+                    **ydl_opts_flat,
+                    "playlist_items": "1-12",
+                }
+                with YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(videos_url, download=False)
+            
+            try:
+                videos_info = await loop.run_in_executor(executor, fetch_videos)
+                for e in (videos_info.get("entries", []) if videos_info else [])[:12]:
+                    if not e or not e.get("id"):
+                        continue
+                    featured_videos.append({
+                        "id": e.get("id"),
+                        "title": e.get("title"),
+                        "thumbnail": get_best_thumbnail(e.get("thumbnails")),
+                        "duration": e.get("duration"),
+                        "view_count": e.get("view_count")
+                    })
+            except Exception as fallback_err:
+                print(f"Fallback also failed: {fallback_err}")
         
         channel_data["featured_videos"] = featured_videos
         channel_data["video_count"] = len(featured_videos)
